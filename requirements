@@ -1,0 +1,7 @@
+jira
+nbconvert
+python-dotenv
+presidio-analyzer
+presidio-anonymizer
+requests
+ipykernel

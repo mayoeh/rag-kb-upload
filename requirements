@@ -5,3 +5,5 @@ presidio-analyzer
 presidio-anonymizer
 requests
 ipykernel
+beautifulsoup4
+playwright

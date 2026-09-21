@@ -1,4 +1,28 @@
 # rag-kb-upload
+
+## Scraper output and knowledge-base uploads
+
+Generated Markdown files are stored under the repository's `data/` directory:
+
+| Scraper | Output folder |
+| --- | --- |
+| `scrapers/scrape-jira-new.ipynb` | `data/jira/` |
+| `scrapers/scrape-md-only.ipynb` | `data/markdown/` |
+| `scrapers/scrape-website-new.ipynb` | `data/website/` |
+| `scrapers/scrape-wiki-only.ipynb` | `data/wiki/` |
+
+The non-Jira notebooks can run with the repository root or `scrapers/` as
+their working directory. They create their output folders automatically.
+
+Run `python run.py` from the repository root to upload the generated files.
+`app/kb_integration/tasks.py` recursively discovers all `.md` and `.txt` files
+under `data/`, including deeper subfolders and uppercase extensions, and uses
+`business.py` to upload each file and attach it to the configured knowledge base.
+Other file types are skipped. Configure the Open WebUI settings in `.env` first.
+
+Run `python -m unittest discover -s tests -v` to verify notebook exports and
+uploads across sources using temporary files and simulated HTTP responses.
+
 ## Unified Services Repo Outline via Mohamed
 
 ## What this repo is

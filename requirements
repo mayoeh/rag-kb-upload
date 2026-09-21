@@ -5,3 +5,9 @@ presidio-analyzer
 presidio-anonymizer
 requests
 ipykernel
+beautifulsoup4
+playwright
+cloudscraper
+langchain-core
+yt-dlp
+youtube-transcript-api

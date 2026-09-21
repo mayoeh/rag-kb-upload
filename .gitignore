@@ -3,12 +3,9 @@
 .venv/
 __pycache__/
 *.pyc
+auth_cookies.json
 
-data/*
-!data/.gitkeep
-.vscode/
+data/**/*
 
-scrapers/cookies.json
-scrapers/auth_cookies.json
-scrapers/debug_duo.png
-scrapers/debug_final.png
+!data/**/
+!data/**/.gitkeep

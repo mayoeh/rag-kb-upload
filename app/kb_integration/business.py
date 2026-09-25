@@ -10,6 +10,14 @@ from jira import JIRA
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
 
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+import cloudscraper
+from bs4 import BeautifulSoup
+
 from yt_dlp import YoutubeDL
 from youtube_transcript_api import YouTubeTranscriptApi
 
@@ -519,164 +527,6 @@ class UVARCJiraKnowledgeDataManager:
             "failed": failed,
             "files": generated_files,
         }
-
-
-# Open WebUI Knowledge Base
-
-class UVARCKnowledgeBaseManager:
-
-    def __init__(self):
-        self.open_webui_url = os.getenv(
-            "OPENWEBUI_URL"
-        )
-
-        self.api_key = os.getenv(
-            "OPENWEBUI_API_KEY"
-        )
-
-        self.knowledge_base_id = os.getenv(
-            "OPENWEBUI_KB_ID"
-        )
-
-        self.headers = {
-            "Authorization": (
-                f"Bearer {self.api_key}"
-            )
-        }
-
-    def upload_file(self, file_path):
-
-        file_path = Path(file_path)
-
-        print(
-            f"Uploading: {file_path.name}"
-        )
-
-        try:
-            with open(file_path, "rb") as file:
-                response = requests.post(
-                    (
-                        f"{self.open_webui_url}"
-                        "/api/v1/files/"
-                    ),
-                    headers=self.headers,
-                    files={
-                        "file": (
-                            file_path.name,
-                            file,
-                            "text/plain",
-                        )
-                    },
-                    data={
-                        "metadata": "{}"
-                    },
-                )
-
-            if response.status_code not in (
-                200,
-                201,
-            ):
-                print(
-                    "  ERROR uploading file "
-                    f"(HTTP "
-                    f"{response.status_code})"
-                )
-
-                print(
-                    f"  {response.text}"
-                )
-
-                return None
-
-            result = response.json()
-
-            file_id = result.get("id")
-
-            print(
-                "  Uploaded successfully."
-            )
-
-            print(
-                f"  File ID: {file_id}"
-            )
-
-            return file_id
-
-        except Exception as error:
-            print(
-                f"  ERROR: {error}"
-            )
-
-            return None
-
-    def add_file_to_knowledge_base(
-        self,
-        file_id,
-        file_name,
-    ):
-
-        print(
-            f"  Adding {file_name} "
-            "to Knowledge Base..."
-        )
-
-        try:
-            response = requests.post(
-                (
-                    f"{self.open_webui_url}"
-                    "/api/v1/knowledge/"
-                    f"{self.knowledge_base_id}"
-                    "/file/add"
-                ),
-                headers={
-                    **self.headers,
-                    "Content-Type":
-                        "application/json",
-                },
-                json={
-                    "file_id": file_id
-                },
-            )
-
-            if response.status_code not in (
-                200,
-                201,
-            ):
-                print(
-                    "  ERROR adding to "
-                    "Knowledge Base "
-                    f"(HTTP "
-                    f"{response.status_code})"
-                )
-
-                print(
-                    f"  {response.text}"
-                )
-
-                return False
-
-            print(
-                "  Added to Knowledge Base "
-                "successfully."
-            )
-
-            return True
-
-        except Exception as error:
-            print(
-                f"  ERROR: {error}"
-            )
-
-            return False
-
-import re
-import time
-import xml.etree.ElementTree as ET
-from pathlib import Path
-from urllib.parse import urljoin, urlparse
-
-import cloudscraper
-from bs4 import BeautifulSoup
 
 
 class UVARCWebsiteKnowledgeDataManager:
@@ -1406,3 +1256,151 @@ class UVARCMarkdownKnowledgeDataManager:
             "failed": failed,
             "files": generated_files,
         }
+
+# Open WebUI Knowledge Base
+
+class UVARCKnowledgeBaseManager:
+
+    def __init__(self):
+        self.open_webui_url = os.getenv(
+            "OPENWEBUI_URL"
+        )
+
+        self.api_key = os.getenv(
+            "OPENWEBUI_API_KEY"
+        )
+
+        self.knowledge_base_id = os.getenv(
+            "OPENWEBUI_KB_ID"
+        )
+
+        self.headers = {
+            "Authorization": (
+                f"Bearer {self.api_key}"
+            )
+        }
+
+    def upload_file(self, file_path):
+
+        file_path = Path(file_path)
+
+        print(
+            f"Uploading: {file_path.name}"
+        )
+
+        try:
+            with open(file_path, "rb") as file:
+                response = requests.post(
+                    (
+                        f"{self.open_webui_url}"
+                        "/api/v1/files/"
+                    ),
+                    headers=self.headers,
+                    files={
+                        "file": (
+                            file_path.name,
+                            file,
+                            "text/plain",
+                        )
+                    },
+                    data={
+                        "metadata": "{}"
+                    },
+                )
+
+            if response.status_code not in (
+                200,
+                201,
+            ):
+                print(
+                    "  ERROR uploading file "
+                    f"(HTTP "
+                    f"{response.status_code})"
+                )
+
+                print(
+                    f"  {response.text}"
+                )
+
+                return None
+
+            result = response.json()
+
+            file_id = result.get("id")
+
+            print(
+                "  Uploaded successfully."
+            )
+
+            print(
+                f"  File ID: {file_id}"
+            )
+
+            return file_id
+
+        except Exception as error:
+            print(
+                f"  ERROR: {error}"
+            )
+
+            return None
+
+    def add_file_to_knowledge_base(
+        self,
+        file_id,
+        file_name,
+    ):
+
+        print(
+            f"  Adding {file_name} "
+            "to Knowledge Base..."
+        )
+
+        try:
+            response = requests.post(
+                (
+                    f"{self.open_webui_url}"
+                    "/api/v1/knowledge/"
+                    f"{self.knowledge_base_id}"
+                    "/file/add"
+                ),
+                headers={
+                    **self.headers,
+                    "Content-Type":
+                        "application/json",
+                },
+                json={
+                    "file_id": file_id
+                },
+            )
+
+            if response.status_code not in (
+                200,
+                201,
+            ):
+                print(
+                    "  ERROR adding to "
+                    "Knowledge Base "
+                    f"(HTTP "
+                    f"{response.status_code})"
+                )
+
+                print(
+                    f"  {response.text}"
+                )
+
+                return False
+
+            print(
+                "  Added to Knowledge Base "
+                "successfully."
+            )
+
+            return True
+
+        except Exception as error:
+            print(
+                f"  ERROR: {error}"
+            )
+
+            return False

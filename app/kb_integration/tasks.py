@@ -4,6 +4,7 @@ import time
 from .business import (
     UVARCJiraKnowledgeDataManager,
     UVARCKnowledgeBaseManager,
+    UVARCWebsiteKnowledgeDataManager
 )
 
 
@@ -39,6 +40,20 @@ def update_jira_knowledge():
 
     return result
 
+def update_website_knowledge():
+
+    print("Updating RC Website(s) Knowledge")
+
+    website_folder = KNOWLEDGE_FOLDER / "website"
+
+    manager = UVARCWebsiteKnowledgeDataManager(
+        output_folder=website_folder
+    )
+
+    manager.generate_knowledge_documents()
+
+    print()
+    print("Website Update Complete")
 
 def update_all_sources():
     # Regenerate local knowledge documents for every source.

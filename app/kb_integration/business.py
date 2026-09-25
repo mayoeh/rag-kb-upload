@@ -665,3 +665,295 @@ class UVARCKnowledgeBaseManager:
             )
 
             return False
+
+import re
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+import cloudscraper
+from bs4 import BeautifulSoup
+
+
+class UVARCWebsiteKnowledgeDataManager:
+    SKIP_EXTENSIONS = (
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", 
+        ".pdf", ".zip", ".tar", ".gz", ".mp4", ".webp"
+    )
+    ALLOWED_NETLOCS = {
+        "rc.virginia.edu", 
+        "learning.rc.virginia.edu", 
+        "archive.rc.virginia.edu"
+    }
+    SKIP_PATTERNS = ['/author/', '/category/', '/tag/']
+
+    def __init__(self, output_folder):
+        self.scraper = cloudscraper.create_scraper()
+        self.visited = set()
+        self.documents = {}
+        self.output_folder = output_folder
+
+    def is_valid(self, url):
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        return (
+            parsed.scheme in {"http", "https"}
+            and parsed.netloc in self.ALLOWED_NETLOCS
+            and not path.endswith(self.SKIP_EXTENSIONS)
+        )
+
+    def crawl(self, url, netloc=None):
+        if url in self.visited:
+            return self.documents
+        self.visited.add(url)
+
+        netloc = netloc or urlparse(url).netloc
+
+        try:
+            response = self.scraper.get(url, timeout=15)
+
+            if response.url != url:
+                url = response.url
+                if url in self.visited:
+                    return self.documents
+                self.visited.add(url)
+
+            content_type = response.headers.get("Content-Type", "")
+            if "text/html" not in content_type:
+                return self.documents
+            if response.status_code != 200:
+                return self.documents
+
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            if len(articles := soup.find_all("article")) != 1:
+                print(f"Skipping {url} (no single article)")
+            else:
+                article_soup = BeautifulSoup(str(articles[0]), "html.parser")
+
+                for tag in article_soup.find_all("img"):
+                    tag.decompose()
+
+                return_link = article_soup.find("a", string=re.compile(r"^\u00ab Return to"))
+                if return_link:
+                    return_link.decompose()
+
+                metadata_tag = article_soup.find("p", class_="blog-post-meta")
+
+                for a_tag in article_soup.find_all("a", href=True):
+                    href = a_tag["href"]
+                    if not href.startswith("http"):
+                        href = urljoin(url, href)
+                    a_tag["href"] = href
+                    a_tag.string = f"[{a_tag.get_text(strip=True)}]({href})"
+
+                title_tag = article_soup.find("h2", class_="blog-post-title")
+                if title_tag:
+                    title_text = title_tag.get_text(strip=True)
+                    title_tag.string = f"# {title_text}\n\n"
+
+                for h1_tag in article_soup.find_all("h1"):
+                    h1_text = h1_tag.get_text(strip=True)
+                    h1_tag.string = f"\n\n## {h1_text}\n"
+
+                if metadata_tag:
+                    metadata_tag.decompose()
+
+                text = article_soup.get_text()
+                text = re.sub(r"https?:\/\/\S+?\.png", "", text)
+                text = re.sub(r"\S+\.png", "", text)
+                text = re.sub(r"\n{3,}", "\n\n", text)
+                text = re.sub(r"[ \t]+", " ", text)
+
+                self.documents[url] = {
+                    "text": text.strip(),
+                    "source": url,
+                }
+                print(f"Extracted: {url}")
+
+            for a_tag in soup.find_all("a", href=True):
+                next_url = a_tag["href"]
+                if not next_url.startswith(("http://", "https://")):
+                    next_url = urljoin(url, next_url)
+                next_url = next_url.split("#")[0]
+
+                if next_url not in self.visited and self.is_valid(next_url):
+                    self.crawl(next_url, netloc)
+
+            time.sleep(0.2)
+
+        except Exception as e:
+            print(f"Failed to crawl {url}: {e}")
+
+        return self.documents
+
+    def get_sitemap_urls(self, sitemap_url, skip_patterns=None):
+        skip_patterns = skip_patterns or []
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+        print(f"Fetching sitemap: {sitemap_url}")
+        resp = self.scraper.get(sitemap_url, timeout=15)
+        resp.raise_for_status()
+
+        print(f"  Status: {resp.status_code}")
+        print(f"  Content-Type: {resp.headers.get('Content-Type')}")
+
+        try:
+            root = ET.fromstring(resp.text)
+        except ET.ParseError as e:
+            print(f"  Could not parse sitemap XML: {e}")
+            print(f"  Response starts with: {resp.text[:300]!r}")
+            return []
+
+        base = "https://" + sitemap_url.split("/")[2]
+        raw = []
+
+        for url in root.findall("sm:url", ns):
+            loc = url.find("sm:loc", ns)
+            if loc is not None and loc.text:
+                raw.append(loc.text.strip())
+
+        urls = [base + u if u.startswith("/") else u for u in raw]
+        urls = [u for u in urls if not any(pattern in u for pattern in skip_patterns)]
+
+        print(f"  Found {len(urls)} URLs")
+        return urls
+
+    def extract_article(self, url):
+        response = self.scraper.get(url, timeout=15)
+        if response.status_code != 200 or 'text/html' not in response.headers.get('Content-Type', ''):
+            return None
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        articles = soup.find_all('article')
+        if len(articles) != 1:
+            return None
+            
+        article_soup = BeautifulSoup(str(articles[0]), 'html.parser')
+        
+        for tag in article_soup.find_all('img'):
+            tag.decompose()
+            
+        metadata_tag = article_soup.find('p', class_='blog-post-meta')
+        
+        for a_tag in article_soup.find_all('a', href=True):
+            href = a_tag['href']
+            if not href.startswith('http'):
+                href = urljoin(url, href)
+            a_tag['href'] = href
+            a_tag.string = '[' + a_tag.get_text(strip=True) + '](' + href + ')'
+            
+        if metadata_tag:
+            metadata_tag.decompose()
+            
+        text = article_soup.get_text()
+        text = re.sub(r'https?:\/\/\S+?\.png', '', text)
+        text = re.sub(r'\S+\.png', '', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r'[ \t]+', ' ', text)
+        
+        return {'text': text.strip(), 'source': url}
+
+    def fill_sitemap_gaps(self):
+        rc_urls = self.get_sitemap_urls('https://rc.virginia.edu/sitemap.xml')
+        learn_urls = self.get_sitemap_urls('https://learning.rc.virginia.edu/sitemap.xml', self.SKIP_PATTERNS)
+        all_sitemap_urls = rc_urls + learn_urls
+
+        missing = [u for u in all_sitemap_urls if u not in self.documents]
+        print(f"Sitemap total: {len(all_sitemap_urls)}, already crawled: {len(all_sitemap_urls)-len(missing)}, missing: {len(missing)}")
+
+        for url in missing:
+            try:
+                result = self.extract_article(url)
+                if result:
+                    self.documents[url] = result
+                    print(f"Added: {url}")
+                else:
+                    print(f"Skipped (no article): {url}")
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"Failed {url}: {e}")
+
+        print(f"\nTotal documents after gap fill: {len(self.documents)}")
+
+    def patch_js_rendered_pages(self):
+        manual_patches = {
+            "https://rc.virginia.edu/userinfo/hpc/slurm-script-generator/": {
+                "text": "# Slurm Script Generator\n\nThe UVA Research Computing Slurm Script Generator...",
+                "source": "https://rc.virginia.edu/userinfo/hpc/slurm-script-generator/",
+            },
+            "https://rc.virginia.edu/userinfo/hpc/software/physics/": {
+                "text": "# Physics Software on UVA HPC\n\nUVA Research Computing provides several physics...",
+                "source": "https://rc.virginia.edu/userinfo/hpc/software/physics/",
+            }
+        }
+
+        patched = 0
+        for url, doc in manual_patches.items():
+            if url not in self.documents or len(self.documents.get(url, {}).get("text", "")) < 100:
+                self.documents[url] = doc
+                patched += 1
+                print(f"Patched: {url}")
+            else:
+                print(f"Already has content: {url}")
+
+        print(f"\nManually patched {patched} JS-rendered pages.")
+        print(f"Total documents: {len(self.documents)}")
+
+    @staticmethod
+    def safe_filename(url):
+        filename = re.sub(r'[^a-zA-Z0-9_\-]', '_', url)
+        filename = re.sub(r'_+', '_', filename).strip('_')
+        return filename[:150]
+
+    def generate_markdown_files(self):
+        project_root = next(
+            (path for path in (Path.cwd(), *Path.cwd().parents)
+             if (path / "app" / "kb_integration" / "tasks.py").is_file()
+             and (path / "scrapers").is_dir()),
+            None,
+        )
+        if project_root is None:
+            raise RuntimeError("Run this notebook from the repository root or a subfolder.")
+
+        output_folder = self.output_folder
+        output_folder.mkdir(parents=True, exist_ok=True)
+
+        print(f"Documents available: {len(self.documents)}")
+        print(f"Writing files to: {output_folder}")
+
+        created = 0
+        failed = 0
+
+        for url, doc in self.documents.items():
+            try:
+                flat_name = f"{self.safe_filename(url)}.md"
+                file_path = output_folder / flat_name
+
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(doc["text"].strip() + "\n")
+
+                created += 1
+                print(f"Created: {file_path.name}")
+            except Exception as e:
+                failed += 1
+                print(f"ERROR processing {url}: {e}")
+
+        print("=" * 60)
+        print("MARKDOWN GENERATION COMPLETE")
+        print("=" * 60)
+        print(f"Created: {created} files")
+        print(f"Failed:  {failed} files")
+
+    def generate_knowledge_documents(self):
+        print("Starting knowledge file generation...")
+
+        # Scraping Logic
+        self.crawl("https://rc.virginia.edu/")
+        self.crawl("https://learning.rc.virginia.edu/")
+        self.fill_sitemap_gaps()
+        self.patch_js_rendered_pages()
+
+        # Generate Markdown files from generated documents
+        self.generate_markdown_files()

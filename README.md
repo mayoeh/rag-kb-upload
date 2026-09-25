@@ -1,27 +1,162 @@
 # rag-kb-upload
 
-## Scraper output and knowledge-base uploads
+## Knowledge Base Integration
 
-Generated Markdown files are stored under the repository's `data/` directory:
+This project retrieves content from UVA Research Computing knowledge sources, converts the content into Markdown, stores it locally under `data/`, and provides a separate process for uploading generated documents to Open WebUI.
 
-| Scraper | Output folder |
-| --- | --- |
-| `scrapers/scrape-jira-new.ipynb` | `data/jira/` |
-| `scrapers/scrape-md-only.ipynb` | `data/markdown/` |
-| `scrapers/scrape-website-new.ipynb` | `data/website/` |
-| `scrapers/scrape-wiki-only.ipynb` | `data/wiki/` |
+Production scraper logic is located in:
 
-The non-Jira notebooks can run with the repository root or `scrapers/` as
-their working directory. They create their output folders automatically.
+```text
+app/kb_integration/
+├── business.py
+└── tasks.py
+```
 
-Run `python run.py` from the repository root to upload the generated files.
-`app/kb_integration/tasks.py` recursively discovers all `.md` and `.txt` files
-under `data/`, including deeper subfolders and uppercase extensions, and uses
-`business.py` to upload each file and attach it to the configured knowledge base.
-Other file types are skipped. Configure the Open WebUI settings in `.env` first.
+The notebooks under `scrapers/` are retained for development and reference, but are not used by the production workflow.
 
-Run `python -m unittest discover -s tests -v` to verify notebook exports and
-uploads across sources using temporary files and simulated HTTP responses.
+## Knowledge Sources
+
+Generated knowledge documents are stored under the repository's `data/` directory:
+
+| Source | Manager | Output folder |
+| --- | --- | --- |
+| JIRA | `UVARCJiraKnowledgeDataManager` | `data/jira/` |
+| RC Learning / Markdown | `UVARCMarkdownKnowledgeDataManager` | `data/markdown/` |
+| Website | `UVARCWebsiteKnowledgeDataManager` | `data/website/` |
+| Wiki | `UVARCWikiKnowledgeDataManager` | `data/wiki/` |
+| Video / YouTube | `UVARCVideoKnowledgeDataManager` | `data/video/` |
+
+## Project Structure
+
+```text
+rag-kb-upload/
+├── app/
+│   └── kb_integration/
+│       ├── __init__.py
+│       ├── business.py
+│       └── tasks.py
+├── data/
+│   ├── jira/
+│   ├── markdown/
+│   ├── video/
+│   ├── website/
+│   └── wiki/
+├── scrapers/
+├── .env
+├── .env.example
+├── requirements.txt
+└── run.py
+```
+
+### `business.py`
+
+Contains the source-specific knowledge managers and Open WebUI integration.
+
+```text
+UVARCLocalKnowledgeDataManager
+UVARCJiraKnowledgeDataManager
+UVARCMarkdownKnowledgeDataManager
+UVARCVideoKnowledgeDataManager
+UVARCWebsiteKnowledgeDataManager
+UVARCWikiKnowledgeDataManager
+UVARCKnowledgeBaseManager
+```
+
+### `tasks.py`
+
+Contains the tasks used to run individual source updates, all source updates, and Open WebUI uploads.
+
+```text
+update_jira_knowledge()
+update_markdown_knowledge()
+update_video_knowledge()
+update_website_knowledge()
+update_wiki_knowledge()
+update_all_sources()
+update_knowledge_base()
+```
+
+## Local Document Updates
+
+Each source uses a stable identifier when generating its local filename.
+
+Examples:
+
+```text
+JIRA issue key       -> jira_SUP-1234.md
+YouTube video ID     -> youtube_abc123.md
+GitHub source path   -> tutorials_slurm.md
+Website URL/path     -> userinfo_rivanna_overview.md
+Wiki page ID/path    -> wiki_184928.md
+```
+
+When a document is scraped, its newly generated content is compared with the existing local file.
+
+```text
+File does not exist       -> Created
+File exists and is same   -> Unchanged
+File exists and changed   -> Updated
+```
+
+Existing files are overwritten when their source content changes rather than creating duplicate local files.
+
+## Running the Scrapers
+
+Run commands from the repository root.
+
+### JIRA
+
+```bash
+python run.py jira
+```
+
+### Video
+
+```bash
+python run.py video
+```
+
+### Markdown / RC Learning
+
+```bash
+python run.py markdown
+```
+
+Additional individual source commands can be added as the Website and Wiki managers are integrated.
+
+### All Sources
+
+```bash
+python run.py scrape
+```
+
+This runs all currently integrated source updates and generates/updates the local Markdown documents under `data/`.
+
+**Running a scraper does not upload files to Open WebUI.**
+
+## Uploading to Open WebUI
+
+Uploading is a separate operation:
+
+```bash
+python run.py upload
+```
+
+This recursively discovers `.md` and `.txt` files under `data/` and uses `UVARCKnowledgeBaseManager` to upload them and attach them to the configured Open WebUI knowledge base.
+
+Configure the required Open WebUI and source credentials in `.env` before running the application.
+
+## Full Manual Refresh
+
+To update all local knowledge documents and then upload them:
+
+```bash
+python run.py scrape
+python run.py upload
+```
+
+These operations remain separate so generated knowledge documents can be inspected before they are uploaded.
+
 
 ## Unified Services Repo Outline via Mohamed
 

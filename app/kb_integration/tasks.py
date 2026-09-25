@@ -34,11 +34,6 @@ def update_jira_knowledge():
     result = manager.generate_knowledge_documents()
 
     print()
-    print("JIRA Update Complete")
-    print(f"Fetched:   {result['fetched']}")
-    print(f"Generated: {result['generated']}")
-    print(f"Skipped:   {result['skipped']}")
-    print(f"Failed:    {result['failed']}")
 
     return result
 
@@ -70,9 +65,6 @@ def update_video_knowledge():
 
     print()
     print("Video Update Complete")
-    print(f"Fetched:   {result['fetched']}")
-    print(f"Generated: {result['generated']}")
-    print(f"Failed:    {result['failed']}")
 
     return result
 
@@ -89,9 +81,6 @@ def update_markdown_knowledge():
 
     print()
     print("Markdown Update Complete")
-    print(f"Fetched:   {result['fetched']}")
-    print(f"Generated: {result['generated']}")
-    print(f"Failed:    {result['failed']}")
 
     return result
 

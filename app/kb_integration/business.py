@@ -24,6 +24,82 @@ from youtube_transcript_api import YouTubeTranscriptApi
 
 load_dotenv()
 
+class UVARCLocalKnowledgeDataManager:
+
+    def __init__(self, output_folder):
+        self.output_folder = Path(output_folder)
+        self.output_folder.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    def save_document(self, filename, content):
+        file_path = self.output_folder / filename
+
+        content = content.strip() + "\n"
+
+        # New document
+        if not file_path.exists():
+            file_path.write_text(
+                content,
+                encoding="utf-8",
+            )
+
+            return {
+                "status": "created",
+                "file": file_path,
+            }
+
+        # Existing document
+        existing_content = file_path.read_text(
+            encoding="utf-8"
+        )
+
+        # Nothing changed
+        if existing_content == content:
+            return {
+                "status": "unchanged",
+                "file": file_path,
+            }
+
+        # Content changed
+        file_path.write_text(
+            content,
+            encoding="utf-8",
+        )
+
+        return {
+            "status": "updated",
+            "file": file_path,
+        }
+
+def build_generation_result(
+    fetched,
+    created,
+    updated,
+    unchanged,
+    skipped,
+    failed,
+    changed_files,
+):
+    print("KNOWLEDGE GENERATION COMPLETE")
+    print(f"Fetched:   {fetched}")
+    print(f"Created:   {created}")
+    print(f"Updated:   {updated}")
+    print(f"Unchanged: {unchanged}")
+    print(f"Skipped:   {skipped}")
+    print(f"Failed:    {failed}")
+
+    return {
+        "fetched": fetched,
+        "created": created,
+        "updated": updated,
+        "unchanged": unchanged,
+        "skipped": skipped,
+        "failed": failed,
+        "changed_files": changed_files,
+    }
+
 # Jira Knowledge
 class UVARCJiraKnowledgeDataManager:
     # Handles all generation of JIRA knowledge base
@@ -35,6 +111,12 @@ class UVARCJiraKnowledgeDataManager:
 
     def __init__(self, output_folder):
         self.output_folder = Path(output_folder)
+
+        self.local_documents = (
+            UVARCLocalKnowledgeDataManager(
+                output_folder
+            )
+        )
 
         self.server = os.getenv("JIRA_SERVER")
         self.email = os.getenv("JIRA_EMAIL")
@@ -462,37 +544,25 @@ class UVARCJiraKnowledgeDataManager:
 
     def _write_markdown(self, issue):
 
-        self.output_folder.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        filename = f"jira_{issue['key']}.md"
 
-        filename = (
-            f"jira_{issue['key']}_0.md"
-        )
+        markdown = self._build_markdown(issue)
 
-        file_path = (
-            self.output_folder / filename
-        )
-
-        markdown = self._build_markdown(
-            issue
-        )
-
-        file_path.write_text(
+        return self.local_documents.save_document(
+            filename,
             markdown,
-            encoding="utf-8",
         )
-
-        return file_path
 
     def generate_knowledge_documents(self):
-
         issues = self.get_resolved_issues()
 
-        generated_files = []
+        created = 0
+        updated = 0
+        unchanged = 0
         skipped = 0
         failed = 0
+
+        changed_files = []
 
         for issue in issues:
             try:
@@ -504,12 +574,27 @@ class UVARCJiraKnowledgeDataManager:
                     skipped += 1
                     continue
 
-                file_path = self._write_markdown(
+                result = self._write_markdown(
                     processed_issue
                 )
 
-                generated_files.append(
-                    file_path
+                status = result["status"]
+                file_path = result["file"]
+
+                if status == "created":
+                    created += 1
+                    changed_files.append(file_path)
+
+                elif status == "updated":
+                    updated += 1
+                    changed_files.append(file_path)
+
+                elif status == "unchanged":
+                    unchanged += 1
+
+                print(
+                    f"{status.capitalize()}: "
+                    f"{file_path.name}"
                 )
 
             except Exception as error:
@@ -520,13 +605,15 @@ class UVARCJiraKnowledgeDataManager:
                     f"{issue.key}: {error}"
                 )
 
-        return {
-            "fetched": len(issues),
-            "generated": len(generated_files),
-            "skipped": skipped,
-            "failed": failed,
-            "files": generated_files,
-        }
+        return build_generation_result(
+            fetched=len(issues),
+            created=created,
+            updated=updated,
+            unchanged=unchanged,
+            skipped=skipped,
+            failed=failed,
+            changed_files=changed_files,
+        )
 
 
 class UVARCWebsiteKnowledgeDataManager:
@@ -545,7 +632,13 @@ class UVARCWebsiteKnowledgeDataManager:
         self.scraper = cloudscraper.create_scraper()
         self.visited = set()
         self.documents = {}
-        self.output_folder = output_folder
+        self.output_folder = Path(output_folder)
+
+        self.local_documents = (
+            UVARCLocalKnowledgeDataManager(
+                output_folder
+            )
+        )
 
     def is_valid(self, url):
         parsed = urlparse(url)
@@ -761,55 +854,88 @@ class UVARCWebsiteKnowledgeDataManager:
         return filename[:150]
 
     def generate_markdown_files(self):
-        project_root = next(
-            (path for path in (Path.cwd(), *Path.cwd().parents)
-             if (path / "app" / "kb_integration" / "tasks.py").is_file()
-             and (path / "scrapers").is_dir()),
-            None,
+        print(
+            f"Documents available: "
+            f"{len(self.documents)}"
         )
-        if project_root is None:
-            raise RuntimeError("Run this notebook from the repository root or a subfolder.")
 
-        output_folder = self.output_folder
-        output_folder.mkdir(parents=True, exist_ok=True)
-
-        print(f"Documents available: {len(self.documents)}")
-        print(f"Writing files to: {output_folder}")
+        print(
+            f"Writing files to: "
+            f"{self.output_folder}"
+        )
 
         created = 0
+        updated = 0
+        unchanged = 0
+        skipped = 0
         failed = 0
+
+        changed_files = []
 
         for url, doc in self.documents.items():
             try:
-                flat_name = f"{self.safe_filename(url)}.md"
-                file_path = output_folder / flat_name
+                filename = (
+                    f"{self.safe_filename(url)}.md"
+                )
 
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(doc["text"].strip() + "\n")
+                result = (
+                    self.local_documents.save_document(
+                        filename,
+                        doc["text"],
+                    )
+                )
 
-                created += 1
-                print(f"Created: {file_path.name}")
+                status = result["status"]
+                file_path = result["file"]
+
+                if status == "created":
+                    created += 1
+                    changed_files.append(file_path)
+
+                elif status == "updated":
+                    updated += 1
+                    changed_files.append(file_path)
+
+                elif status == "unchanged":
+                    unchanged += 1
+
+                print(
+                    f"{status.capitalize()}: "
+                    f"{file_path.name}"
+                )
+
             except Exception as e:
                 failed += 1
-                print(f"ERROR processing {url}: {e}")
 
-        print("=" * 60)
-        print("MARKDOWN GENERATION COMPLETE")
-        print("=" * 60)
-        print(f"Created: {created} files")
-        print(f"Failed:  {failed} files")
+                print(
+                    f"ERROR processing {url}: {e}"
+                )
+
+        return build_generation_result(
+            fetched=len(self.documents),
+            created=created,
+            updated=updated,
+            unchanged=unchanged,
+            skipped=skipped,
+            failed=failed,
+            changed_files=changed_files,
+        )
 
     def generate_knowledge_documents(self):
         print("Starting knowledge file generation...")
 
-        # Scraping Logic
-        self.crawl("https://rc.virginia.edu/")
-        self.crawl("https://learning.rc.virginia.edu/")
+        self.crawl(
+            "https://rc.virginia.edu/"
+        )
+
+        self.crawl(
+            "https://learning.rc.virginia.edu/"
+        )
+
         self.fill_sitemap_gaps()
         self.patch_js_rendered_pages()
 
-        # Generate Markdown files from generated documents
-        self.generate_markdown_files()
+        return self.generate_markdown_files()
 
 
 class UVARCVideoKnowledgeDataManager:
@@ -821,6 +947,12 @@ class UVARCVideoKnowledgeDataManager:
 
     def __init__(self, output_folder):
         self.output_folder = Path(output_folder)
+
+        self.local_documents = (
+            UVARCLocalKnowledgeDataManager(
+                output_folder
+            )
+        )
 
     def _fetch_playlist(self):
         ydl_options = {
@@ -959,38 +1091,28 @@ class UVARCVideoKnowledgeDataManager:
 
     def _write_markdown(self, video):
 
-        self.output_folder.mkdir(
-            parents=True,
-            exist_ok=True,
+        filename = (
+            f"youtube_{video['id']}.md"
         )
 
-        title = video["metadata"]["title"]
+        markdown = self._build_markdown(video)
 
-        filename = self._safe_filename(
-            f"youtube_{title}.md"
-        )
-
-        file_path = (
-            self.output_folder / filename
-        )
-
-        markdown = self._build_markdown(
-            video
-        )
-
-        file_path.write_text(
+        return self.local_documents.save_document(
+            filename,
             markdown,
-            encoding="utf-8",
         )
-
-        return file_path
 
     def generate_knowledge_documents(self):
 
         entries = self._fetch_playlist()
 
-        generated_files = []
+        created = 0
+        updated = 0
+        unchanged = 0
+        skipped = 0
         failed = 0
+
+        changed_files = []
 
         for entry in entries:
             try:
@@ -1003,16 +1125,27 @@ class UVARCVideoKnowledgeDataManager:
                     entry
                 )
 
-                file_path = self._write_markdown(
+                result = self._write_markdown(
                     video
                 )
 
-                generated_files.append(
-                    file_path
-                )
+                status = result["status"]
+                file_path = result["file"]
+
+                if status == "created":
+                    created += 1
+                    changed_files.append(file_path)
+
+                elif status == "updated":
+                    updated += 1
+                    changed_files.append(file_path)
+
+                elif status == "unchanged":
+                    unchanged += 1
 
                 print(
-                    f"Created: {file_path.name}"
+                    f"{status.capitalize()}: "
+                    f"{file_path.name}"
                 )
 
             except Exception as error:
@@ -1024,14 +1157,15 @@ class UVARCVideoKnowledgeDataManager:
                     f"{error}"
                 )
 
-        return {
-            "fetched": len(entries),
-            "generated": len(
-                generated_files
-            ),
-            "failed": failed,
-            "files": generated_files,
-        }
+        return build_generation_result(
+            fetched=len(entries),
+            created=created,
+            updated=updated,
+            unchanged=unchanged,
+            skipped=skipped,
+            failed=failed,
+            changed_files=changed_files,
+        )
 
 class UVARCMarkdownKnowledgeDataManager:
 
@@ -1041,6 +1175,12 @@ class UVARCMarkdownKnowledgeDataManager:
 
     def __init__(self, output_folder):
         self.output_folder = Path(output_folder)
+
+        self.local_documents = (
+            UVARCLocalKnowledgeDataManager(
+                output_folder
+            )
+        )
 
     def _fetch_repository_tree(self):
         tree_url = (
@@ -1139,25 +1279,14 @@ class UVARCMarkdownKnowledgeDataManager:
         return f"{flat_name}.md"
 
     def _write_markdown(self, document):
-        self.output_folder.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
         filename = self._build_filename(
             document["source"]
         )
 
-        file_path = (
-            self.output_folder / filename
+        return self.local_documents.save_document(
+            filename,
+            document["content"],
         )
-
-        file_path.write_text(
-            document["content"].strip() + "\n",
-            encoding="utf-8",
-        )
-
-        return file_path
 
     def generate_knowledge_documents(self):
         tree = self._fetch_repository_tree()
@@ -1173,8 +1302,14 @@ class UVARCMarkdownKnowledgeDataManager:
         )
 
         documents = []
-        failed = 0
+
+        created = 0
+        updated = 0
+        unchanged = 0
         skipped = 0
+        failed = 0
+
+        changed_files = []
 
         for item in markdown_files:
             path = item["path"]
@@ -1211,6 +1346,13 @@ class UVARCMarkdownKnowledgeDataManager:
             for document in documents
         }
 
+        duplicate_count = (
+            len(documents)
+            - len(unique_documents)
+        )
+
+        skipped += duplicate_count
+
         documents = list(
             unique_documents.values()
         )
@@ -1220,22 +1362,29 @@ class UVARCMarkdownKnowledgeDataManager:
             f"documents after deduplication"
         )
 
-        generated_files = []
-
         for document in documents:
             try:
-                file_path = (
-                    self._write_markdown(
-                        document
-                    )
+                result = self._write_markdown(
+                    document
                 )
 
-                generated_files.append(
-                    file_path
-                )
+                status = result["status"]
+                file_path = result["file"]
+
+                if status == "created":
+                    created += 1
+                    changed_files.append(file_path)
+
+                elif status == "updated":
+                    updated += 1
+                    changed_files.append(file_path)
+
+                elif status == "unchanged":
+                    unchanged += 1
 
                 print(
-                    f"Created: {file_path.name}"
+                    f"{status.capitalize()}: "
+                    f"{file_path.name}"
                 )
 
             except Exception as error:
@@ -1247,15 +1396,15 @@ class UVARCMarkdownKnowledgeDataManager:
                     f"{error}"
                 )
 
-        return {
-            "fetched": len(markdown_files),
-            "generated": len(
-                generated_files
-            ),
-            "skipped": skipped,
-            "failed": failed,
-            "files": generated_files,
-        }
+        return build_generation_result(
+            fetched=len(markdown_files),
+            created=created,
+            updated=updated,
+            unchanged=unchanged,
+            skipped=skipped,
+            failed=failed,
+            changed_files=changed_files,
+        )
 
 # Open WebUI Knowledge Base
 

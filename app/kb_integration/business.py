@@ -10,6 +10,9 @@ from jira import JIRA
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
 
+from yt_dlp import YoutubeDL
+from youtube_transcript_api import YouTubeTranscriptApi
+
 
 load_dotenv()
 
@@ -957,3 +960,225 @@ class UVARCWebsiteKnowledgeDataManager:
 
         # Generate Markdown files from generated documents
         self.generate_markdown_files()
+
+
+class UVARCVideoKnowledgeDataManager:
+
+    PLAYLIST_URL = (
+        "https://www.youtube.com/playlist"
+        "?list=PLT4bryHgBcRP7N-hB9u6EWs6tq_2nMoRO"
+    )
+
+    def __init__(self, output_folder):
+        self.output_folder = Path(output_folder)
+
+    def _fetch_playlist(self):
+        ydl_options = {
+            "extract_flat": True,
+            "quiet": True,
+        }
+
+        with YoutubeDL(ydl_options) as ydl:
+            info = ydl.extract_info(
+                self.PLAYLIST_URL,
+                download=False,
+            )
+
+        entries = info.get("entries", [])
+
+        print(
+            f"Found {len(entries)} videos in: "
+            f"{info.get('title', 'Unknown')}"
+        )
+
+        return entries
+
+    def _get_video_metadata(self, video_url):
+
+        ydl_options = {
+            "quiet": True,
+            "skip_download": True,
+        }
+
+        with YoutubeDL(ydl_options) as ydl:
+            info = ydl.extract_info(
+                video_url,
+                download=False,
+            )
+
+        return {
+            "title": info.get("title", ""),
+            "author": info.get("uploader", ""),
+            "description": info.get(
+                "description",
+                "",
+            ),
+            "length": info.get("duration", 0),
+            "publish_date": info.get(
+                "upload_date",
+                "",
+            ),
+            "webpage_url": info.get(
+                "webpage_url",
+                video_url,
+            ),
+        }
+
+    def _get_transcript(self, video_id):
+
+        api = YouTubeTranscriptApi()
+
+        transcript = api.fetch(
+            video_id,
+            languages=["en"],
+        )
+
+        return " ".join(
+            entry.text.strip()
+            for entry in transcript
+            if entry.text.strip()
+        )
+
+    def _process_video(self, entry):
+
+        video_url = entry["url"]
+
+        video_id = entry.get(
+            "id",
+            video_url.split("v=")[-1],
+        )
+
+        metadata = self._get_video_metadata(
+            video_url
+        )
+
+        transcript = self._get_transcript(
+            video_id
+        )
+
+        return {
+            "id": video_id,
+            "metadata": metadata,
+            "transcript": transcript,
+        }
+    
+    def _safe_filename(self, filename):
+
+        filename = re.sub(
+            r'[<>:"/\\|?*]',
+            "_",
+            filename,
+        )
+
+        filename = re.sub(
+            r"\s+",
+            " ",
+            filename,
+        ).strip()
+
+        return filename[:150]
+
+    def _build_markdown(self, video):
+
+        metadata = video["metadata"]
+        transcript = video["transcript"]
+
+        markdown = f"""# {metadata["title"]}
+
+            ## Video Information
+
+            **Source:** YouTube
+            **Author:** {metadata["author"]}
+            **URL:** {metadata["webpage_url"]}
+            **Publish Date:** {metadata["publish_date"]}
+
+            ---
+
+            ## Description
+
+            {metadata["description"]}
+
+            ---
+
+            ## Transcript
+
+            {transcript}
+            """
+
+        return markdown.strip() + "\n"
+
+    def _write_markdown(self, video):
+
+        self.output_folder.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        title = video["metadata"]["title"]
+
+        filename = self._safe_filename(
+            f"youtube_{title}.md"
+        )
+
+        file_path = (
+            self.output_folder / filename
+        )
+
+        markdown = self._build_markdown(
+            video
+        )
+
+        file_path.write_text(
+            markdown,
+            encoding="utf-8",
+        )
+
+        return file_path
+
+    def generate_knowledge_documents(self):
+
+        entries = self._fetch_playlist()
+
+        generated_files = []
+        failed = 0
+
+        for entry in entries:
+            try:
+                print(
+                    f"Loading: "
+                    f"{entry.get('title', 'Unknown')}"
+                )
+
+                video = self._process_video(
+                    entry
+                )
+
+                file_path = self._write_markdown(
+                    video
+                )
+
+                generated_files.append(
+                    file_path
+                )
+
+                print(
+                    f"Created: {file_path.name}"
+                )
+
+            except Exception as error:
+                failed += 1
+
+                print(
+                    f"Failed to process "
+                    f"{entry.get('title', 'Unknown')}: "
+                    f"{error}"
+                )
+
+        return {
+            "fetched": len(entries),
+            "generated": len(
+                generated_files
+            ),
+            "failed": failed,
+            "files": generated_files,
+        }

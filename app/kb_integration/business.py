@@ -10,8 +10,95 @@ from jira import JIRA
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
 
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+import cloudscraper
+from bs4 import BeautifulSoup
+
+from yt_dlp import YoutubeDL
+from youtube_transcript_api import YouTubeTranscriptApi
+
 
 load_dotenv()
+
+class UVARCLocalKnowledgeDataManager:
+
+    def __init__(self, output_folder):
+        self.output_folder = Path(output_folder)
+        self.output_folder.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    def save_document(self, filename, content):
+        file_path = self.output_folder / filename
+
+        content = content.strip() + "\n"
+
+        # New document
+        if not file_path.exists():
+            file_path.write_text(
+                content,
+                encoding="utf-8",
+            )
+
+            return {
+                "status": "created",
+                "file": file_path,
+            }
+
+        # Existing document
+        existing_content = file_path.read_text(
+            encoding="utf-8"
+        )
+
+        # Nothing changed
+        if existing_content == content:
+            return {
+                "status": "unchanged",
+                "file": file_path,
+            }
+
+        # Content changed
+        file_path.write_text(
+            content,
+            encoding="utf-8",
+        )
+
+        return {
+            "status": "updated",
+            "file": file_path,
+        }
+
+def build_generation_result(
+    fetched,
+    created,
+    updated,
+    unchanged,
+    skipped,
+    failed,
+    changed_files,
+):
+    print("KNOWLEDGE GENERATION COMPLETE")
+    print(f"Fetched:   {fetched}")
+    print(f"Created:   {created}")
+    print(f"Updated:   {updated}")
+    print(f"Unchanged: {unchanged}")
+    print(f"Skipped:   {skipped}")
+    print(f"Failed:    {failed}")
+
+    return {
+        "fetched": fetched,
+        "created": created,
+        "updated": updated,
+        "unchanged": unchanged,
+        "skipped": skipped,
+        "failed": failed,
+        "changed_files": changed_files,
+    }
 
 # Jira Knowledge
 class UVARCJiraKnowledgeDataManager:
@@ -24,6 +111,12 @@ class UVARCJiraKnowledgeDataManager:
 
     def __init__(self, output_folder):
         self.output_folder = Path(output_folder)
+
+        self.local_documents = (
+            UVARCLocalKnowledgeDataManager(
+                output_folder
+            )
+        )
 
         self.server = os.getenv("JIRA_SERVER")
         self.email = os.getenv("JIRA_EMAIL")
@@ -451,37 +544,25 @@ class UVARCJiraKnowledgeDataManager:
 
     def _write_markdown(self, issue):
 
-        self.output_folder.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        filename = f"jira_{issue['key']}.md"
 
-        filename = (
-            f"jira_{issue['key']}_0.md"
-        )
+        markdown = self._build_markdown(issue)
 
-        file_path = (
-            self.output_folder / filename
-        )
-
-        markdown = self._build_markdown(
-            issue
-        )
-
-        file_path.write_text(
+        return self.local_documents.save_document(
+            filename,
             markdown,
-            encoding="utf-8",
         )
-
-        return file_path
 
     def generate_knowledge_documents(self):
-
         issues = self.get_resolved_issues()
 
-        generated_files = []
+        created = 0
+        updated = 0
+        unchanged = 0
         skipped = 0
         failed = 0
+
+        changed_files = []
 
         for issue in issues:
             try:
@@ -493,12 +574,27 @@ class UVARCJiraKnowledgeDataManager:
                     skipped += 1
                     continue
 
-                file_path = self._write_markdown(
+                result = self._write_markdown(
                     processed_issue
                 )
 
-                generated_files.append(
-                    file_path
+                status = result["status"]
+                file_path = result["file"]
+
+                if status == "created":
+                    created += 1
+                    changed_files.append(file_path)
+
+                elif status == "updated":
+                    updated += 1
+                    changed_files.append(file_path)
+
+                elif status == "unchanged":
+                    unchanged += 1
+
+                print(
+                    f"{status.capitalize()}: "
+                    f"{file_path.name}"
                 )
 
             except Exception as error:
@@ -509,171 +605,15 @@ class UVARCJiraKnowledgeDataManager:
                     f"{issue.key}: {error}"
                 )
 
-        return {
-            "fetched": len(issues),
-            "generated": len(generated_files),
-            "skipped": skipped,
-            "failed": failed,
-            "files": generated_files,
-        }
-
-
-# Open WebUI Knowledge Base
-
-class UVARCKnowledgeBaseManager:
-
-    def __init__(self):
-        self.open_webui_url = os.getenv(
-            "OPENWEBUI_URL"
+        return build_generation_result(
+            fetched=len(issues),
+            created=created,
+            updated=updated,
+            unchanged=unchanged,
+            skipped=skipped,
+            failed=failed,
+            changed_files=changed_files,
         )
-
-        self.api_key = os.getenv(
-            "OPENWEBUI_API_KEY"
-        )
-
-        self.knowledge_base_id = os.getenv(
-            "OPENWEBUI_KB_ID"
-        )
-
-        self.headers = {
-            "Authorization": (
-                f"Bearer {self.api_key}"
-            )
-        }
-
-    def upload_file(self, file_path):
-
-        file_path = Path(file_path)
-
-        print(
-            f"Uploading: {file_path.name}"
-        )
-
-        try:
-            with open(file_path, "rb") as file:
-                response = requests.post(
-                    (
-                        f"{self.open_webui_url}"
-                        "/api/v1/files/"
-                    ),
-                    headers=self.headers,
-                    files={
-                        "file": (
-                            file_path.name,
-                            file,
-                            "text/plain",
-                        )
-                    },
-                    data={
-                        "metadata": "{}"
-                    },
-                )
-
-            if response.status_code not in (
-                200,
-                201,
-            ):
-                print(
-                    "  ERROR uploading file "
-                    f"(HTTP "
-                    f"{response.status_code})"
-                )
-
-                print(
-                    f"  {response.text}"
-                )
-
-                return None
-
-            result = response.json()
-
-            file_id = result.get("id")
-
-            print(
-                "  Uploaded successfully."
-            )
-
-            print(
-                f"  File ID: {file_id}"
-            )
-
-            return file_id
-
-        except Exception as error:
-            print(
-                f"  ERROR: {error}"
-            )
-
-            return None
-
-    def add_file_to_knowledge_base(
-        self,
-        file_id,
-        file_name,
-    ):
-
-        print(
-            f"  Adding {file_name} "
-            "to Knowledge Base..."
-        )
-
-        try:
-            response = requests.post(
-                (
-                    f"{self.open_webui_url}"
-                    "/api/v1/knowledge/"
-                    f"{self.knowledge_base_id}"
-                    "/file/add"
-                ),
-                headers={
-                    **self.headers,
-                    "Content-Type":
-                        "application/json",
-                },
-                json={
-                    "file_id": file_id
-                },
-            )
-
-            if response.status_code not in (
-                200,
-                201,
-            ):
-                print(
-                    "  ERROR adding to "
-                    "Knowledge Base "
-                    f"(HTTP "
-                    f"{response.status_code})"
-                )
-
-                print(
-                    f"  {response.text}"
-                )
-
-                return False
-
-            print(
-                "  Added to Knowledge Base "
-                "successfully."
-            )
-
-            return True
-
-        except Exception as error:
-            print(
-                f"  ERROR: {error}"
-            )
-
-            return False
-
-import re
-import time
-import xml.etree.ElementTree as ET
-from pathlib import Path
-from urllib.parse import urljoin, urlparse
-
-import cloudscraper
-from bs4 import BeautifulSoup
 
 
 class UVARCWebsiteKnowledgeDataManager:
@@ -692,7 +632,13 @@ class UVARCWebsiteKnowledgeDataManager:
         self.scraper = cloudscraper.create_scraper()
         self.visited = set()
         self.documents = {}
-        self.output_folder = output_folder
+        self.output_folder = Path(output_folder)
+
+        self.local_documents = (
+            UVARCLocalKnowledgeDataManager(
+                output_folder
+            )
+        )
 
     def is_valid(self, url):
         parsed = urlparse(url)
@@ -908,52 +854,702 @@ class UVARCWebsiteKnowledgeDataManager:
         return filename[:150]
 
     def generate_markdown_files(self):
-        project_root = next(
-            (path for path in (Path.cwd(), *Path.cwd().parents)
-             if (path / "app" / "kb_integration" / "tasks.py").is_file()
-             and (path / "scrapers").is_dir()),
-            None,
+        print(
+            f"Documents available: "
+            f"{len(self.documents)}"
         )
-        if project_root is None:
-            raise RuntimeError("Run this notebook from the repository root or a subfolder.")
 
-        output_folder = self.output_folder
-        output_folder.mkdir(parents=True, exist_ok=True)
-
-        print(f"Documents available: {len(self.documents)}")
-        print(f"Writing files to: {output_folder}")
+        print(
+            f"Writing files to: "
+            f"{self.output_folder}"
+        )
 
         created = 0
+        updated = 0
+        unchanged = 0
+        skipped = 0
         failed = 0
+
+        changed_files = []
 
         for url, doc in self.documents.items():
             try:
-                flat_name = f"{self.safe_filename(url)}.md"
-                file_path = output_folder / flat_name
+                filename = (
+                    f"{self.safe_filename(url)}.md"
+                )
 
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(doc["text"].strip() + "\n")
+                result = (
+                    self.local_documents.save_document(
+                        filename,
+                        doc["text"],
+                    )
+                )
 
-                created += 1
-                print(f"Created: {file_path.name}")
+                status = result["status"]
+                file_path = result["file"]
+
+                if status == "created":
+                    created += 1
+                    changed_files.append(file_path)
+
+                elif status == "updated":
+                    updated += 1
+                    changed_files.append(file_path)
+
+                elif status == "unchanged":
+                    unchanged += 1
+
+                print(
+                    f"{status.capitalize()}: "
+                    f"{file_path.name}"
+                )
+
             except Exception as e:
                 failed += 1
-                print(f"ERROR processing {url}: {e}")
 
-        print("=" * 60)
-        print("MARKDOWN GENERATION COMPLETE")
-        print("=" * 60)
-        print(f"Created: {created} files")
-        print(f"Failed:  {failed} files")
+                print(
+                    f"ERROR processing {url}: {e}"
+                )
+
+        return build_generation_result(
+            fetched=len(self.documents),
+            created=created,
+            updated=updated,
+            unchanged=unchanged,
+            skipped=skipped,
+            failed=failed,
+            changed_files=changed_files,
+        )
 
     def generate_knowledge_documents(self):
         print("Starting knowledge file generation...")
 
-        # Scraping Logic
-        self.crawl("https://rc.virginia.edu/")
-        self.crawl("https://learning.rc.virginia.edu/")
+        self.crawl(
+            "https://rc.virginia.edu/"
+        )
+
+        self.crawl(
+            "https://learning.rc.virginia.edu/"
+        )
+
         self.fill_sitemap_gaps()
         self.patch_js_rendered_pages()
 
-        # Generate Markdown files from generated documents
-        self.generate_markdown_files()
+        return self.generate_markdown_files()
+
+
+class UVARCVideoKnowledgeDataManager:
+
+    PLAYLIST_URL = (
+        "https://www.youtube.com/playlist"
+        "?list=PLT4bryHgBcRP7N-hB9u6EWs6tq_2nMoRO"
+    )
+
+    def __init__(self, output_folder):
+        self.output_folder = Path(output_folder)
+
+        self.local_documents = (
+            UVARCLocalKnowledgeDataManager(
+                output_folder
+            )
+        )
+
+    def _fetch_playlist(self):
+        ydl_options = {
+            "extract_flat": True,
+            "quiet": True,
+        }
+
+        with YoutubeDL(ydl_options) as ydl:
+            info = ydl.extract_info(
+                self.PLAYLIST_URL,
+                download=False,
+            )
+
+        entries = info.get("entries", [])
+
+        print(
+            f"Found {len(entries)} videos in: "
+            f"{info.get('title', 'Unknown')}"
+        )
+
+        return entries
+
+    def _get_video_metadata(self, video_url):
+
+        ydl_options = {
+            "quiet": True,
+            "skip_download": True,
+        }
+
+        with YoutubeDL(ydl_options) as ydl:
+            info = ydl.extract_info(
+                video_url,
+                download=False,
+            )
+
+        return {
+            "title": info.get("title", ""),
+            "author": info.get("uploader", ""),
+            "description": info.get(
+                "description",
+                "",
+            ),
+            "length": info.get("duration", 0),
+            "publish_date": info.get(
+                "upload_date",
+                "",
+            ),
+            "webpage_url": info.get(
+                "webpage_url",
+                video_url,
+            ),
+        }
+
+    def _get_transcript(self, video_id):
+
+        api = YouTubeTranscriptApi()
+
+        transcript = api.fetch(
+            video_id,
+            languages=["en"],
+        )
+
+        return " ".join(
+            entry.text.strip()
+            for entry in transcript
+            if entry.text.strip()
+        )
+
+    def _process_video(self, entry):
+
+        video_url = entry["url"]
+
+        video_id = entry.get(
+            "id",
+            video_url.split("v=")[-1],
+        )
+
+        metadata = self._get_video_metadata(
+            video_url
+        )
+
+        transcript = self._get_transcript(
+            video_id
+        )
+
+        return {
+            "id": video_id,
+            "metadata": metadata,
+            "transcript": transcript,
+        }
+    
+    def _safe_filename(self, filename):
+
+        filename = re.sub(
+            r'[<>:"/\\|?*]',
+            "_",
+            filename,
+        )
+
+        filename = re.sub(
+            r"\s+",
+            " ",
+            filename,
+        ).strip()
+
+        return filename[:150]
+
+    def _build_markdown(self, video):
+
+        metadata = video["metadata"]
+        transcript = video["transcript"]
+
+        markdown = f"""# {metadata["title"]}
+
+            ## Video Information
+
+            **Source:** YouTube
+            **Author:** {metadata["author"]}
+            **URL:** {metadata["webpage_url"]}
+            **Publish Date:** {metadata["publish_date"]}
+
+            ---
+
+            ## Description
+
+            {metadata["description"]}
+
+            ---
+
+            ## Transcript
+
+            {transcript}
+            """
+
+        return markdown.strip() + "\n"
+
+    def _write_markdown(self, video):
+
+        filename = (
+            f"youtube_{video['id']}.md"
+        )
+
+        markdown = self._build_markdown(video)
+
+        return self.local_documents.save_document(
+            filename,
+            markdown,
+        )
+
+    def generate_knowledge_documents(self):
+
+        entries = self._fetch_playlist()
+
+        created = 0
+        updated = 0
+        unchanged = 0
+        skipped = 0
+        failed = 0
+
+        changed_files = []
+
+        for entry in entries:
+            try:
+                print(
+                    f"Loading: "
+                    f"{entry.get('title', 'Unknown')}"
+                )
+
+                video = self._process_video(
+                    entry
+                )
+
+                result = self._write_markdown(
+                    video
+                )
+
+                status = result["status"]
+                file_path = result["file"]
+
+                if status == "created":
+                    created += 1
+                    changed_files.append(file_path)
+
+                elif status == "updated":
+                    updated += 1
+                    changed_files.append(file_path)
+
+                elif status == "unchanged":
+                    unchanged += 1
+
+                print(
+                    f"{status.capitalize()}: "
+                    f"{file_path.name}"
+                )
+
+            except Exception as error:
+                failed += 1
+
+                print(
+                    f"Failed to process "
+                    f"{entry.get('title', 'Unknown')}: "
+                    f"{error}"
+                )
+
+        return build_generation_result(
+            fetched=len(entries),
+            created=created,
+            updated=updated,
+            unchanged=unchanged,
+            skipped=skipped,
+            failed=failed,
+            changed_files=changed_files,
+        )
+
+class UVARCMarkdownKnowledgeDataManager:
+
+    GITHUB_REPO = "uvarc/rc-learning"
+    GITHUB_BRANCH = "main"
+    CONTENT_PATH = "content"
+
+    def __init__(self, output_folder):
+        self.output_folder = Path(output_folder)
+
+        self.local_documents = (
+            UVARCLocalKnowledgeDataManager(
+                output_folder
+            )
+        )
+
+    def _fetch_repository_tree(self):
+        tree_url = (
+            f"https://api.github.com/repos/"
+            f"{self.GITHUB_REPO}/git/trees/"
+            f"{self.GITHUB_BRANCH}?recursive=1"
+        )
+
+        response = requests.get(
+            tree_url,
+            timeout=30,
+        )
+
+        response.raise_for_status()
+
+        return response.json().get("tree", [])
+
+    def _get_markdown_files(self, tree):
+        return [
+            item
+            for item in tree
+            if item["type"] == "blob"
+            and item["path"].startswith(
+                self.CONTENT_PATH + "/"
+            )
+            and item["path"].endswith(".md")
+        ]
+
+    def _fetch_markdown_file(self, path):
+        raw_url = (
+            f"https://raw.githubusercontent.com/"
+            f"{self.GITHUB_REPO}/"
+            f"{self.GITHUB_BRANCH}/"
+            f"{path}"
+        )
+
+        response = requests.get(
+            raw_url,
+            timeout=15,
+        )
+
+        response.raise_for_status()
+
+        return response.text
+
+    def _is_draft(self, text):
+        # TOML frontmatter
+        if text.startswith("+++"):
+            end = text.find("+++", 3)
+
+            if end != -1:
+                frontmatter = text[3:end]
+
+                if "draft = true" in frontmatter:
+                    return True
+
+        # YAML frontmatter
+        if text.startswith("---"):
+            end = text.find("---", 3)
+
+            if end != -1:
+                frontmatter = text[3:end]
+
+                if "draft: true" in frontmatter:
+                    return True
+
+        return False
+
+    def _safe_filename(self, filename):
+        filename = re.sub(
+            r'[<>:"\\|?*]',
+            "_",
+            filename,
+        )
+
+        filename = re.sub(
+            r"\s+",
+            " ",
+            filename,
+        ).strip()
+
+        return filename[:150]
+
+    def _build_filename(self, source):
+        relative_path = source.split(
+            f"{self.CONTENT_PATH}/",
+            1,
+        )[-1]
+
+        flat_name = self._safe_filename(
+            relative_path
+            .removesuffix(".md")
+            .replace("/", "_")
+        )
+
+        return f"{flat_name}.md"
+
+    def _write_markdown(self, document):
+        filename = self._build_filename(
+            document["source"]
+        )
+
+        return self.local_documents.save_document(
+            filename,
+            document["content"],
+        )
+
+    def generate_knowledge_documents(self):
+        tree = self._fetch_repository_tree()
+
+        markdown_files = self._get_markdown_files(
+            tree
+        )
+
+        print(
+            f"Found {len(markdown_files)} "
+            f"Markdown files in "
+            f"{self.GITHUB_REPO}/{self.CONTENT_PATH}"
+        )
+
+        documents = []
+
+        created = 0
+        updated = 0
+        unchanged = 0
+        skipped = 0
+        failed = 0
+
+        changed_files = []
+
+        for item in markdown_files:
+            path = item["path"]
+
+            try:
+                text = self._fetch_markdown_file(
+                    path
+                )
+
+                if self._is_draft(text):
+                    print(
+                        f"Skipping draft: {path}"
+                    )
+
+                    skipped += 1
+                    continue
+
+                documents.append({
+                    "source": path,
+                    "content": text,
+                })
+
+            except Exception as error:
+                failed += 1
+
+                print(
+                    f"Failed to fetch {path}: "
+                    f"{error}"
+                )
+
+        # Deduplicate identical content
+        unique_documents = {
+            document["content"]: document
+            for document in documents
+        }
+
+        duplicate_count = (
+            len(documents)
+            - len(unique_documents)
+        )
+
+        skipped += duplicate_count
+
+        documents = list(
+            unique_documents.values()
+        )
+
+        print(
+            f"Loaded {len(documents)} "
+            f"documents after deduplication"
+        )
+
+        for document in documents:
+            try:
+                result = self._write_markdown(
+                    document
+                )
+
+                status = result["status"]
+                file_path = result["file"]
+
+                if status == "created":
+                    created += 1
+                    changed_files.append(file_path)
+
+                elif status == "updated":
+                    updated += 1
+                    changed_files.append(file_path)
+
+                elif status == "unchanged":
+                    unchanged += 1
+
+                print(
+                    f"{status.capitalize()}: "
+                    f"{file_path.name}"
+                )
+
+            except Exception as error:
+                failed += 1
+
+                print(
+                    f"Failed to write "
+                    f"{document['source']}: "
+                    f"{error}"
+                )
+
+        return build_generation_result(
+            fetched=len(markdown_files),
+            created=created,
+            updated=updated,
+            unchanged=unchanged,
+            skipped=skipped,
+            failed=failed,
+            changed_files=changed_files,
+        )
+
+# Open WebUI Knowledge Base
+
+class UVARCKnowledgeBaseManager:
+
+    def __init__(self):
+        self.open_webui_url = os.getenv(
+            "OPENWEBUI_URL"
+        )
+
+        self.api_key = os.getenv(
+            "OPENWEBUI_API_KEY"
+        )
+
+        self.knowledge_base_id = os.getenv(
+            "OPENWEBUI_KB_ID"
+        )
+
+        self.headers = {
+            "Authorization": (
+                f"Bearer {self.api_key}"
+            )
+        }
+
+    def upload_file(self, file_path):
+
+        file_path = Path(file_path)
+
+        print(
+            f"Uploading: {file_path.name}"
+        )
+
+        try:
+            with open(file_path, "rb") as file:
+                response = requests.post(
+                    (
+                        f"{self.open_webui_url}"
+                        "/api/v1/files/"
+                    ),
+                    headers=self.headers,
+                    files={
+                        "file": (
+                            file_path.name,
+                            file,
+                            "text/plain",
+                        )
+                    },
+                    data={
+                        "metadata": "{}"
+                    },
+                )
+
+            if response.status_code not in (
+                200,
+                201,
+            ):
+                print(
+                    "  ERROR uploading file "
+                    f"(HTTP "
+                    f"{response.status_code})"
+                )
+
+                print(
+                    f"  {response.text}"
+                )
+
+                return None
+
+            result = response.json()
+
+            file_id = result.get("id")
+
+            print(
+                "  Uploaded successfully."
+            )
+
+            print(
+                f"  File ID: {file_id}"
+            )
+
+            return file_id
+
+        except Exception as error:
+            print(
+                f"  ERROR: {error}"
+            )
+
+            return None
+
+    def add_file_to_knowledge_base(
+        self,
+        file_id,
+        file_name,
+    ):
+
+        print(
+            f"  Adding {file_name} "
+            "to Knowledge Base..."
+        )
+
+        try:
+            response = requests.post(
+                (
+                    f"{self.open_webui_url}"
+                    "/api/v1/knowledge/"
+                    f"{self.knowledge_base_id}"
+                    "/file/add"
+                ),
+                headers={
+                    **self.headers,
+                    "Content-Type":
+                        "application/json",
+                },
+                json={
+                    "file_id": file_id
+                },
+            )
+
+            if response.status_code not in (
+                200,
+                201,
+            ):
+                print(
+                    "  ERROR adding to "
+                    "Knowledge Base "
+                    f"(HTTP "
+                    f"{response.status_code})"
+                )
+
+                print(
+                    f"  {response.text}"
+                )
+
+                return False
+
+            print(
+                "  Added to Knowledge Base "
+                "successfully."
+            )
+
+            return True
+
+        except Exception as error:
+            print(
+                f"  ERROR: {error}"
+            )
+
+            return False

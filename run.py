@@ -3,6 +3,9 @@ import argparse
 from app.kb_integration.tasks import (
     update_all_sources,
     update_jira_knowledge,
+    update_website_knowledge,
+    update_video_knowledge,
+    update_markdown_knowledge,
     update_knowledge_base,
 )
 
@@ -16,11 +19,17 @@ def main():
         "task",
         choices=[
             "jira",
+            "website",
+            "video",
+            "markdown",
             "scrape",
             "upload",
         ],
         help=(
             "jira = update JIRA knowledge, "
+            "website = update website knowledge, "
+            "video = update Youtube knowledge, "
+            "markdown = update tutorial knowledge, "
             "scrape = update all knowledge sources, "
             "upload = upload existing files to Open WebUI"
         ),
@@ -30,6 +39,15 @@ def main():
 
     if args.task == "jira":
         update_jira_knowledge()
+
+    elif args.task == "website":
+        update_website_knowledge()
+
+    elif args.task == "video":
+        update_video_knowledge()
+
+    elif args.task == "markdown":
+        update_markdown_knowledge()
 
     elif args.task == "scrape":
         update_all_sources()

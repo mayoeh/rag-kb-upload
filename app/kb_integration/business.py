@@ -676,7 +676,7 @@ import cloudscraper
 from bs4 import BeautifulSoup
 
 
-class WebsiteDataManager:
+class UVARCWebsiteKnowledgeDataManager:
     SKIP_EXTENSIONS = (
         ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", 
         ".pdf", ".zip", ".tar", ".gz", ".mp4", ".webp"
@@ -688,10 +688,11 @@ class WebsiteDataManager:
     }
     SKIP_PATTERNS = ['/author/', '/category/', '/tag/']
 
-    def __init__(self):
+    def __init__(self, output_folder):
         self.scraper = cloudscraper.create_scraper()
         self.visited = set()
         self.documents = {}
+        self.output_folder = output_folder
 
     def is_valid(self, url):
         parsed = urlparse(url)
@@ -916,7 +917,7 @@ class WebsiteDataManager:
         if project_root is None:
             raise RuntimeError("Run this notebook from the repository root or a subfolder.")
 
-        output_folder = project_root / "data" / "website"
+        output_folder = self.output_folder
         output_folder.mkdir(parents=True, exist_ok=True)
 
         print(f"Documents available: {len(self.documents)}")
@@ -944,7 +945,6 @@ class WebsiteDataManager:
         print("=" * 60)
         print(f"Created: {created} files")
         print(f"Failed:  {failed} files")
-        print(f"Output folder: {output_folder}")
 
     def generate_knowledge_documents(self):
         print("Starting knowledge file generation...")

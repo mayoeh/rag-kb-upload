@@ -5,7 +5,8 @@ from .business import (
     UVARCJiraKnowledgeDataManager,
     UVARCVideoKnowledgeDataManager,
     UVARCWebsiteKnowledgeDataManager,
-    UVARCKnowledgeBaseManager
+    UVARCMarkdownKnowledgeDataManager,
+    UVARCKnowledgeBaseManager,
 )
 
 
@@ -75,6 +76,25 @@ def update_video_knowledge():
 
     return result
 
+def update_markdown_knowledge():
+    print("Updating Markdown Knowledge")
+
+    markdown_folder = KNOWLEDGE_FOLDER / "markdown"
+
+    manager = UVARCMarkdownKnowledgeDataManager(
+        output_folder=markdown_folder
+    )
+
+    result = manager.generate_knowledge_documents()
+
+    print()
+    print("Markdown Update Complete")
+    print(f"Fetched:   {result['fetched']}")
+    print(f"Generated: {result['generated']}")
+    print(f"Failed:    {result['failed']}")
+
+    return result
+
 def update_all_sources():
     # Regenerate local knowledge documents for every source.
 
@@ -85,6 +105,7 @@ def update_all_sources():
     results["jira"] = update_jira_knowledge()
     results["website"] = update_website_knowledge()
     results["video"] = update_video_knowledge()
+    results["markdown"] = update_markdown_knowledge()
 
     print()
     print("Knowledge Source Update Complete")

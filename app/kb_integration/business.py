@@ -1182,3 +1182,227 @@ class UVARCVideoKnowledgeDataManager:
             "failed": failed,
             "files": generated_files,
         }
+
+class UVARCMarkdownKnowledgeDataManager:
+
+    GITHUB_REPO = "uvarc/rc-learning"
+    GITHUB_BRANCH = "main"
+    CONTENT_PATH = "content"
+
+    def __init__(self, output_folder):
+        self.output_folder = Path(output_folder)
+
+    def _fetch_repository_tree(self):
+        tree_url = (
+            f"https://api.github.com/repos/"
+            f"{self.GITHUB_REPO}/git/trees/"
+            f"{self.GITHUB_BRANCH}?recursive=1"
+        )
+
+        response = requests.get(
+            tree_url,
+            timeout=30,
+        )
+
+        response.raise_for_status()
+
+        return response.json().get("tree", [])
+
+    def _get_markdown_files(self, tree):
+        return [
+            item
+            for item in tree
+            if item["type"] == "blob"
+            and item["path"].startswith(
+                self.CONTENT_PATH + "/"
+            )
+            and item["path"].endswith(".md")
+        ]
+
+    def _fetch_markdown_file(self, path):
+        raw_url = (
+            f"https://raw.githubusercontent.com/"
+            f"{self.GITHUB_REPO}/"
+            f"{self.GITHUB_BRANCH}/"
+            f"{path}"
+        )
+
+        response = requests.get(
+            raw_url,
+            timeout=15,
+        )
+
+        response.raise_for_status()
+
+        return response.text
+
+    def _is_draft(self, text):
+        # TOML frontmatter
+        if text.startswith("+++"):
+            end = text.find("+++", 3)
+
+            if end != -1:
+                frontmatter = text[3:end]
+
+                if "draft = true" in frontmatter:
+                    return True
+
+        # YAML frontmatter
+        if text.startswith("---"):
+            end = text.find("---", 3)
+
+            if end != -1:
+                frontmatter = text[3:end]
+
+                if "draft: true" in frontmatter:
+                    return True
+
+        return False
+
+    def _safe_filename(self, filename):
+        filename = re.sub(
+            r'[<>:"\\|?*]',
+            "_",
+            filename,
+        )
+
+        filename = re.sub(
+            r"\s+",
+            " ",
+            filename,
+        ).strip()
+
+        return filename[:150]
+
+    def _build_filename(self, source):
+        relative_path = source.split(
+            f"{self.CONTENT_PATH}/",
+            1,
+        )[-1]
+
+        flat_name = self._safe_filename(
+            relative_path
+            .removesuffix(".md")
+            .replace("/", "_")
+        )
+
+        return f"{flat_name}.md"
+
+    def _write_markdown(self, document):
+        self.output_folder.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        filename = self._build_filename(
+            document["source"]
+        )
+
+        file_path = (
+            self.output_folder / filename
+        )
+
+        file_path.write_text(
+            document["content"].strip() + "\n",
+            encoding="utf-8",
+        )
+
+        return file_path
+
+    def generate_knowledge_documents(self):
+        tree = self._fetch_repository_tree()
+
+        markdown_files = self._get_markdown_files(
+            tree
+        )
+
+        print(
+            f"Found {len(markdown_files)} "
+            f"Markdown files in "
+            f"{self.GITHUB_REPO}/{self.CONTENT_PATH}"
+        )
+
+        documents = []
+        failed = 0
+        skipped = 0
+
+        for item in markdown_files:
+            path = item["path"]
+
+            try:
+                text = self._fetch_markdown_file(
+                    path
+                )
+
+                if self._is_draft(text):
+                    print(
+                        f"Skipping draft: {path}"
+                    )
+
+                    skipped += 1
+                    continue
+
+                documents.append({
+                    "source": path,
+                    "content": text,
+                })
+
+            except Exception as error:
+                failed += 1
+
+                print(
+                    f"Failed to fetch {path}: "
+                    f"{error}"
+                )
+
+        # Deduplicate identical content
+        unique_documents = {
+            document["content"]: document
+            for document in documents
+        }
+
+        documents = list(
+            unique_documents.values()
+        )
+
+        print(
+            f"Loaded {len(documents)} "
+            f"documents after deduplication"
+        )
+
+        generated_files = []
+
+        for document in documents:
+            try:
+                file_path = (
+                    self._write_markdown(
+                        document
+                    )
+                )
+
+                generated_files.append(
+                    file_path
+                )
+
+                print(
+                    f"Created: {file_path.name}"
+                )
+
+            except Exception as error:
+                failed += 1
+
+                print(
+                    f"Failed to write "
+                    f"{document['source']}: "
+                    f"{error}"
+                )
+
+        return {
+            "fetched": len(markdown_files),
+            "generated": len(
+                generated_files
+            ),
+            "skipped": skipped,
+            "failed": failed,
+            "files": generated_files,
+        }

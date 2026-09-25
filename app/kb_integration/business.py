@@ -945,3 +945,15 @@ class WebsiteDataManager:
         print(f"Created: {created} files")
         print(f"Failed:  {failed} files")
         print(f"Output folder: {output_folder}")
+
+    def generate_knowledge_documents(self):
+        print("Starting knowledge file generation...")
+
+        # Scraping Logic
+        self.crawl("https://rc.virginia.edu/")
+        self.crawl("https://learning.rc.virginia.edu/")
+        self.fill_sitemap_gaps()
+        self.patch_js_rendered_pages()
+
+        # Generate Markdown files from generated documents
+        self.generate_markdown_files()

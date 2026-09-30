@@ -122,7 +122,24 @@ python run.py video
 python run.py markdown
 ```
 
-Additional individual source commands can be added as the Website and Wiki managers are integrated.
+### RCI Wiki
+
+```bash
+python run.py auth   # only when the saved cookies are missing or expired
+python run.py wiki
+```
+
+The RCI wiki sits behind NetBadge and Duo. `python run.py auth` (or
+`python scripts/save_wiki_auth.py`) logs in through a headless browser, asks
+for a Duo push to be approved on a phone, and saves the session cookies to
+`scrapers/auth_cookies.json`. Because it needs a person, it cannot be
+scheduled. `python scripts/save_wiki_auth.py --check` tests the saved cookies.
+
+First-time setup on a machine: `pip install playwright && playwright install chromium`.
+
+`python run.py wiki` reads those cookies and writes `data/wiki/`. In
+`python run.py scrape` the wiki runs last, and if its cookies have expired it
+is skipped with a message instead of stopping the other sources.
 
 ### All Sources
 

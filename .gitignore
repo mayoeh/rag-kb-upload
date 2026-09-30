@@ -9,3 +9,6 @@ data/**/*
 
 !data/**/
 !data/**/.gitkeep
+.backup/
+scrapers/debug/
+scrapers/debug_duo.png

@@ -1,31 +1,25 @@
 import os
 import re
-
-from html import unescape
-from pathlib import Path
-
-import requests
-from dotenv import load_dotenv
-from jira import JIRA
-from presidio_analyzer import AnalyzerEngine
-from presidio_anonymizer import AnonymizerEngine
-
 import time
 import xml.etree.ElementTree as ET
+from html import unescape
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import cloudscraper
+import requests
 from bs4 import BeautifulSoup
-
-from yt_dlp import YoutubeDL
+from dotenv import load_dotenv
+from jira import JIRA
+from presidio_analyzer import AnalyzerEngine
+from presidio_anonymizer import AnonymizerEngine
 from youtube_transcript_api import YouTubeTranscriptApi
-
+from yt_dlp import YoutubeDL
 
 load_dotenv()
 
-class UVARCLocalKnowledgeDataManager:
 
+class UVARCLocalKnowledgeDataManager:
     def __init__(self, output_folder):
         self.output_folder = Path(output_folder)
         self.output_folder.mkdir(
@@ -51,9 +45,7 @@ class UVARCLocalKnowledgeDataManager:
             }
 
         # Existing document
-        existing_content = file_path.read_text(
-            encoding="utf-8"
-        )
+        existing_content = file_path.read_text(encoding="utf-8")
 
         # Nothing changed
         if existing_content == content:
@@ -72,6 +64,7 @@ class UVARCLocalKnowledgeDataManager:
             "status": "updated",
             "file": file_path,
         }
+
 
 def build_generation_result(
     fetched,
@@ -100,6 +93,7 @@ def build_generation_result(
         "changed_files": changed_files,
     }
 
+
 # Jira Knowledge
 class UVARCJiraKnowledgeDataManager:
     # Handles all generation of JIRA knowledge base
@@ -112,11 +106,7 @@ class UVARCJiraKnowledgeDataManager:
     def __init__(self, output_folder):
         self.output_folder = Path(output_folder)
 
-        self.local_documents = (
-            UVARCLocalKnowledgeDataManager(
-                output_folder
-            )
-        )
+        self.local_documents = UVARCLocalKnowledgeDataManager(output_folder)
 
         self.server = os.getenv("JIRA_SERVER")
         self.email = os.getenv("JIRA_EMAIL")
@@ -167,9 +157,7 @@ class UVARCJiraKnowledgeDataManager:
 
             issues.extend(batch)
 
-            print(
-                f"Fetched {len(issues)} JIRA issues so far..."
-            )
+            print(f"Fetched {len(issues)} JIRA issues so far...")
 
             next_page_token = getattr(
                 batch,
@@ -204,9 +192,7 @@ class UVARCJiraKnowledgeDataManager:
             if isinstance(raw_description, str):
                 rendered_description = raw_description
 
-        return self._html_to_text(
-            rendered_description
-        )
+        return self._html_to_text(rendered_description)
 
     def _classify_description(self, description):
         """
@@ -223,16 +209,10 @@ class UVARCJiraKnowledgeDataManager:
             Normal free-text support request.
         """
 
-        if (
-            "Description: " in description
-            or "Description:" in description
-        ):
+        if "Description: " in description or "Description:" in description:
             return "form_with_description"
 
-        if (
-            description.strip().startswith("Name:")
-            or "Uid:" in description[:200]
-        ):
+        if description.strip().startswith("Name:") or "Uid:" in description[:200]:
             return "form_metadata"
 
         return "free_text"
@@ -268,13 +248,8 @@ class UVARCJiraKnowledgeDataManager:
 
         raw_comments = []
 
-        if (
-            hasattr(issue.fields, "comment")
-            and issue.fields.comment
-        ):
-            raw_comments = (
-                issue.fields.comment.comments
-            )
+        if hasattr(issue.fields, "comment") and issue.fields.comment:
+            raw_comments = issue.fields.comment.comments
 
         rendered_comments = []
 
@@ -294,18 +269,11 @@ class UVARCJiraKnowledgeDataManager:
 
         comments = []
 
-        for index, raw_comment in enumerate(
-            raw_comments
-        ):
+        for index, raw_comment in enumerate(raw_comments):
             author = "Unknown"
 
-            if (
-                hasattr(raw_comment, "author")
-                and raw_comment.author
-            ):
-                author = (
-                    raw_comment.author.displayName
-                )
+            if hasattr(raw_comment, "author") and raw_comment.author:
+                author = raw_comment.author.displayName
 
             rendered_body = ""
 
@@ -326,9 +294,7 @@ class UVARCJiraKnowledgeDataManager:
                 ):
                     rendered_body = raw_comment.body
 
-            body = self._html_to_text(
-                rendered_body
-            )
+            body = self._html_to_text(rendered_body)
 
             if body:
                 comments.append(
@@ -426,62 +392,39 @@ class UVARCJiraKnowledgeDataManager:
 
     def _process_issue(self, issue):
 
-        description = self._get_description(
-            issue
-        )
+        description = self._get_description(issue)
 
         if not description:
             return None
 
-        ticket_type = (
-            self._classify_description(
-                description
-            )
-        )
+        ticket_type = self._classify_description(description)
 
         # Type 2 tickets contain primarily form metadata
         if ticket_type == "form_metadata":
             return None
 
         if ticket_type == "form_with_description":
-            description = (
-                self._extract_form_description(
-                    description
-                )
-            )
+            description = self._extract_form_description(description)
 
         if not description:
             return None
 
-        comments = self._extract_comments(
-            issue
-        )
+        comments = self._extract_comments(issue)
 
         processed_comments = []
 
         for comment in comments:
             processed_comments.append(
                 {
-                    "author": self._scrub_text(
-                        comment["author"]
-                    ),
-                    "body": self._scrub_text(
-                        comment["body"]
-                    ),
+                    "author": self._scrub_text(comment["author"]),
+                    "body": self._scrub_text(comment["body"]),
                 }
             )
 
         return {
             "key": issue.key,
-            "summary": self._scrub_text(
-                (
-                    issue.fields.summary
-                    or ""
-                ).strip()
-            ),
-            "description": self._scrub_text(
-                description
-            ),
+            "summary": self._scrub_text((issue.fields.summary or "").strip()),
+            "description": self._scrub_text(description),
             "comments": processed_comments,
         }
 
@@ -489,16 +432,9 @@ class UVARCJiraKnowledgeDataManager:
 
     def _build_markdown(self, issue):
 
+        summary = self._clean_markdown_text(issue["summary"])
 
-        summary = self._clean_markdown_text(
-            issue["summary"]
-        )
-
-        description = (
-            self._clean_markdown_text(
-                issue["description"]
-            )
-        )
+        description = self._clean_markdown_text(issue["description"])
 
         markdown = f"""# {summary}
 
@@ -516,17 +452,12 @@ class UVARCJiraKnowledgeDataManager:
 """
 
         if issue["comments"]:
-            markdown += (
-                "\n---\n\n"
-                "## Resolution and Discussion\n"
-            )
+            markdown += "\n---\n\n## Resolution and Discussion\n"
 
             comment_number = 1
 
             for comment in issue["comments"]:
-                body = self._clean_markdown_text(
-                    comment["body"]
-                )
+                body = self._clean_markdown_text(comment["body"])
 
                 if not body:
                     continue
@@ -566,17 +497,13 @@ class UVARCJiraKnowledgeDataManager:
 
         for issue in issues:
             try:
-                processed_issue = self._process_issue(
-                    issue
-                )
+                processed_issue = self._process_issue(issue)
 
                 if processed_issue is None:
                     skipped += 1
                     continue
 
-                result = self._write_markdown(
-                    processed_issue
-                )
+                result = self._write_markdown(processed_issue)
 
                 status = result["status"]
                 file_path = result["file"]
@@ -592,18 +519,12 @@ class UVARCJiraKnowledgeDataManager:
                 elif status == "unchanged":
                     unchanged += 1
 
-                print(
-                    f"{status.capitalize()}: "
-                    f"{file_path.name}"
-                )
+                print(f"{status.capitalize()}: {file_path.name}")
 
             except Exception as error:
                 failed += 1
 
-                print(
-                    f"Failed to process "
-                    f"{issue.key}: {error}"
-                )
+                print(f"Failed to process {issue.key}: {error}")
 
         return build_generation_result(
             fetched=len(issues),
@@ -618,15 +539,25 @@ class UVARCJiraKnowledgeDataManager:
 
 class UVARCWebsiteKnowledgeDataManager:
     SKIP_EXTENSIONS = (
-        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", 
-        ".pdf", ".zip", ".tar", ".gz", ".mp4", ".webp"
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".svg",
+        ".pdf",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".mp4",
+        ".webp",
     )
     ALLOWED_NETLOCS = {
-        "rc.virginia.edu", 
-        "learning.rc.virginia.edu", 
-        "archive.rc.virginia.edu"
+        "rc.virginia.edu",
+        "learning.rc.virginia.edu",
+        "archive.rc.virginia.edu",
     }
-    SKIP_PATTERNS = ['/author/', '/category/', '/tag/']
+    SKIP_PATTERNS = ["/author/", "/category/", "/tag/"]
 
     def __init__(self, output_folder):
         self.scraper = cloudscraper.create_scraper()
@@ -634,11 +565,7 @@ class UVARCWebsiteKnowledgeDataManager:
         self.documents = {}
         self.output_folder = Path(output_folder)
 
-        self.local_documents = (
-            UVARCLocalKnowledgeDataManager(
-                output_folder
-            )
-        )
+        self.local_documents = UVARCLocalKnowledgeDataManager(output_folder)
 
     def is_valid(self, url):
         parsed = urlparse(url)
@@ -681,7 +608,9 @@ class UVARCWebsiteKnowledgeDataManager:
                 for tag in article_soup.find_all("img"):
                     tag.decompose()
 
-                return_link = article_soup.find("a", string=re.compile(r"^\u00ab Return to"))
+                return_link = article_soup.find(
+                    "a", string=re.compile(r"^\u00ab Return to")
+                )
                 if return_link:
                     return_link.decompose()
 
@@ -768,46 +697,52 @@ class UVARCWebsiteKnowledgeDataManager:
 
     def extract_article(self, url):
         response = self.scraper.get(url, timeout=15)
-        if response.status_code != 200 or 'text/html' not in response.headers.get('Content-Type', ''):
+        if response.status_code != 200 or "text/html" not in response.headers.get(
+            "Content-Type", ""
+        ):
             return None
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        articles = soup.find_all('article')
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        articles = soup.find_all("article")
         if len(articles) != 1:
             return None
-            
-        article_soup = BeautifulSoup(str(articles[0]), 'html.parser')
-        
-        for tag in article_soup.find_all('img'):
+
+        article_soup = BeautifulSoup(str(articles[0]), "html.parser")
+
+        for tag in article_soup.find_all("img"):
             tag.decompose()
-            
-        metadata_tag = article_soup.find('p', class_='blog-post-meta')
-        
-        for a_tag in article_soup.find_all('a', href=True):
-            href = a_tag['href']
-            if not href.startswith('http'):
+
+        metadata_tag = article_soup.find("p", class_="blog-post-meta")
+
+        for a_tag in article_soup.find_all("a", href=True):
+            href = a_tag["href"]
+            if not href.startswith("http"):
                 href = urljoin(url, href)
-            a_tag['href'] = href
-            a_tag.string = '[' + a_tag.get_text(strip=True) + '](' + href + ')'
-            
+            a_tag["href"] = href
+            a_tag.string = "[" + a_tag.get_text(strip=True) + "](" + href + ")"
+
         if metadata_tag:
             metadata_tag.decompose()
-            
+
         text = article_soup.get_text()
-        text = re.sub(r'https?:\/\/\S+?\.png', '', text)
-        text = re.sub(r'\S+\.png', '', text)
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        text = re.sub(r'[ \t]+', ' ', text)
-        
-        return {'text': text.strip(), 'source': url}
+        text = re.sub(r"https?:\/\/\S+?\.png", "", text)
+        text = re.sub(r"\S+\.png", "", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"[ \t]+", " ", text)
+
+        return {"text": text.strip(), "source": url}
 
     def fill_sitemap_gaps(self):
-        rc_urls = self.get_sitemap_urls('https://rc.virginia.edu/sitemap.xml')
-        learn_urls = self.get_sitemap_urls('https://learning.rc.virginia.edu/sitemap.xml', self.SKIP_PATTERNS)
+        rc_urls = self.get_sitemap_urls("https://rc.virginia.edu/sitemap.xml")
+        learn_urls = self.get_sitemap_urls(
+            "https://learning.rc.virginia.edu/sitemap.xml", self.SKIP_PATTERNS
+        )
         all_sitemap_urls = rc_urls + learn_urls
 
         missing = [u for u in all_sitemap_urls if u not in self.documents]
-        print(f"Sitemap total: {len(all_sitemap_urls)}, already crawled: {len(all_sitemap_urls)-len(missing)}, missing: {len(missing)}")
+        print(
+            f"Sitemap total: {len(all_sitemap_urls)}, already crawled: {len(all_sitemap_urls) - len(missing)}, missing: {len(missing)}"
+        )
 
         for url in missing:
             try:
@@ -832,12 +767,15 @@ class UVARCWebsiteKnowledgeDataManager:
             "https://rc.virginia.edu/userinfo/hpc/software/physics/": {
                 "text": "# Physics Software on UVA HPC\n\nUVA Research Computing provides several physics...",
                 "source": "https://rc.virginia.edu/userinfo/hpc/software/physics/",
-            }
+            },
         }
 
         patched = 0
         for url, doc in manual_patches.items():
-            if url not in self.documents or len(self.documents.get(url, {}).get("text", "")) < 100:
+            if (
+                url not in self.documents
+                or len(self.documents.get(url, {}).get("text", "")) < 100
+            ):
                 self.documents[url] = doc
                 patched += 1
                 print(f"Patched: {url}")
@@ -849,20 +787,14 @@ class UVARCWebsiteKnowledgeDataManager:
 
     @staticmethod
     def safe_filename(url):
-        filename = re.sub(r'[^a-zA-Z0-9_\-]', '_', url)
-        filename = re.sub(r'_+', '_', filename).strip('_')
+        filename = re.sub(r"[^a-zA-Z0-9_\-]", "_", url)
+        filename = re.sub(r"_+", "_", filename).strip("_")
         return filename[:150]
 
     def generate_markdown_files(self):
-        print(
-            f"Documents available: "
-            f"{len(self.documents)}"
-        )
+        print(f"Documents available: {len(self.documents)}")
 
-        print(
-            f"Writing files to: "
-            f"{self.output_folder}"
-        )
+        print(f"Writing files to: {self.output_folder}")
 
         created = 0
         updated = 0
@@ -874,15 +806,11 @@ class UVARCWebsiteKnowledgeDataManager:
 
         for url, doc in self.documents.items():
             try:
-                filename = (
-                    f"{self.safe_filename(url)}.md"
-                )
+                filename = f"{self.safe_filename(url)}.md"
 
-                result = (
-                    self.local_documents.save_document(
-                        filename,
-                        doc["text"],
-                    )
+                result = self.local_documents.save_document(
+                    filename,
+                    doc["text"],
                 )
 
                 status = result["status"]
@@ -899,17 +827,12 @@ class UVARCWebsiteKnowledgeDataManager:
                 elif status == "unchanged":
                     unchanged += 1
 
-                print(
-                    f"{status.capitalize()}: "
-                    f"{file_path.name}"
-                )
+                print(f"{status.capitalize()}: {file_path.name}")
 
             except Exception as e:
                 failed += 1
 
-                print(
-                    f"ERROR processing {url}: {e}"
-                )
+                print(f"ERROR processing {url}: {e}")
 
         return build_generation_result(
             fetched=len(self.documents),
@@ -924,13 +847,9 @@ class UVARCWebsiteKnowledgeDataManager:
     def generate_knowledge_documents(self):
         print("Starting knowledge file generation...")
 
-        self.crawl(
-            "https://rc.virginia.edu/"
-        )
+        self.crawl("https://rc.virginia.edu/")
 
-        self.crawl(
-            "https://learning.rc.virginia.edu/"
-        )
+        self.crawl("https://learning.rc.virginia.edu/")
 
         self.fill_sitemap_gaps()
         self.patch_js_rendered_pages()
@@ -939,20 +858,14 @@ class UVARCWebsiteKnowledgeDataManager:
 
 
 class UVARCVideoKnowledgeDataManager:
-
     PLAYLIST_URL = (
-        "https://www.youtube.com/playlist"
-        "?list=PLT4bryHgBcRP7N-hB9u6EWs6tq_2nMoRO"
+        "https://www.youtube.com/playlist?list=PLT4bryHgBcRP7N-hB9u6EWs6tq_2nMoRO"
     )
 
     def __init__(self, output_folder):
         self.output_folder = Path(output_folder)
 
-        self.local_documents = (
-            UVARCLocalKnowledgeDataManager(
-                output_folder
-            )
-        )
+        self.local_documents = UVARCLocalKnowledgeDataManager(output_folder)
 
     def _fetch_playlist(self):
         ydl_options = {
@@ -968,10 +881,7 @@ class UVARCVideoKnowledgeDataManager:
 
         entries = info.get("entries", [])
 
-        print(
-            f"Found {len(entries)} videos in: "
-            f"{info.get('title', 'Unknown')}"
-        )
+        print(f"Found {len(entries)} videos in: {info.get('title', 'Unknown')}")
 
         return entries
 
@@ -1016,9 +926,7 @@ class UVARCVideoKnowledgeDataManager:
         )
 
         return " ".join(
-            entry.text.strip()
-            for entry in transcript
-            if entry.text.strip()
+            entry.text.strip() for entry in transcript if entry.text.strip()
         )
 
     def _process_video(self, entry):
@@ -1030,20 +938,16 @@ class UVARCVideoKnowledgeDataManager:
             video_url.split("v=")[-1],
         )
 
-        metadata = self._get_video_metadata(
-            video_url
-        )
+        metadata = self._get_video_metadata(video_url)
 
-        transcript = self._get_transcript(
-            video_id
-        )
+        transcript = self._get_transcript(video_id)
 
         return {
             "id": video_id,
             "metadata": metadata,
             "transcript": transcript,
         }
-    
+
     def _safe_filename(self, filename):
 
         filename = re.sub(
@@ -1091,9 +995,7 @@ class UVARCVideoKnowledgeDataManager:
 
     def _write_markdown(self, video):
 
-        filename = (
-            f"youtube_{video['id']}.md"
-        )
+        filename = f"youtube_{video['id']}.md"
 
         markdown = self._build_markdown(video)
 
@@ -1116,18 +1018,11 @@ class UVARCVideoKnowledgeDataManager:
 
         for entry in entries:
             try:
-                print(
-                    f"Loading: "
-                    f"{entry.get('title', 'Unknown')}"
-                )
+                print(f"Loading: {entry.get('title', 'Unknown')}")
 
-                video = self._process_video(
-                    entry
-                )
+                video = self._process_video(entry)
 
-                result = self._write_markdown(
-                    video
-                )
+                result = self._write_markdown(video)
 
                 status = result["status"]
                 file_path = result["file"]
@@ -1143,19 +1038,12 @@ class UVARCVideoKnowledgeDataManager:
                 elif status == "unchanged":
                     unchanged += 1
 
-                print(
-                    f"{status.capitalize()}: "
-                    f"{file_path.name}"
-                )
+                print(f"{status.capitalize()}: {file_path.name}")
 
             except Exception as error:
                 failed += 1
 
-                print(
-                    f"Failed to process "
-                    f"{entry.get('title', 'Unknown')}: "
-                    f"{error}"
-                )
+                print(f"Failed to process {entry.get('title', 'Unknown')}: {error}")
 
         return build_generation_result(
             fetched=len(entries),
@@ -1167,8 +1055,8 @@ class UVARCVideoKnowledgeDataManager:
             changed_files=changed_files,
         )
 
-class UVARCMarkdownKnowledgeDataManager:
 
+class UVARCMarkdownKnowledgeDataManager:
     GITHUB_REPO = "uvarc/rc-learning"
     GITHUB_BRANCH = "main"
     CONTENT_PATH = "content"
@@ -1176,11 +1064,7 @@ class UVARCMarkdownKnowledgeDataManager:
     def __init__(self, output_folder):
         self.output_folder = Path(output_folder)
 
-        self.local_documents = (
-            UVARCLocalKnowledgeDataManager(
-                output_folder
-            )
-        )
+        self.local_documents = UVARCLocalKnowledgeDataManager(output_folder)
 
     def _fetch_repository_tree(self):
         tree_url = (
@@ -1203,9 +1087,7 @@ class UVARCMarkdownKnowledgeDataManager:
             item
             for item in tree
             if item["type"] == "blob"
-            and item["path"].startswith(
-                self.CONTENT_PATH + "/"
-            )
+            and item["path"].startswith(self.CONTENT_PATH + "/")
             and item["path"].endswith(".md")
         ]
 
@@ -1271,17 +1153,13 @@ class UVARCMarkdownKnowledgeDataManager:
         )[-1]
 
         flat_name = self._safe_filename(
-            relative_path
-            .removesuffix(".md")
-            .replace("/", "_")
+            relative_path.removesuffix(".md").replace("/", "_")
         )
 
         return f"{flat_name}.md"
 
     def _write_markdown(self, document):
-        filename = self._build_filename(
-            document["source"]
-        )
+        filename = self._build_filename(document["source"])
 
         return self.local_documents.save_document(
             filename,
@@ -1291,9 +1169,7 @@ class UVARCMarkdownKnowledgeDataManager:
     def generate_knowledge_documents(self):
         tree = self._fetch_repository_tree()
 
-        markdown_files = self._get_markdown_files(
-            tree
-        )
+        markdown_files = self._get_markdown_files(tree)
 
         print(
             f"Found {len(markdown_files)} "
@@ -1315,58 +1191,40 @@ class UVARCMarkdownKnowledgeDataManager:
             path = item["path"]
 
             try:
-                text = self._fetch_markdown_file(
-                    path
-                )
+                text = self._fetch_markdown_file(path)
 
                 if self._is_draft(text):
-                    print(
-                        f"Skipping draft: {path}"
-                    )
+                    print(f"Skipping draft: {path}")
 
                     skipped += 1
                     continue
 
-                documents.append({
-                    "source": path,
-                    "content": text,
-                })
+                documents.append(
+                    {
+                        "source": path,
+                        "content": text,
+                    }
+                )
 
             except Exception as error:
                 failed += 1
 
-                print(
-                    f"Failed to fetch {path}: "
-                    f"{error}"
-                )
+                print(f"Failed to fetch {path}: {error}")
 
         # Deduplicate identical content
-        unique_documents = {
-            document["content"]: document
-            for document in documents
-        }
+        unique_documents = {document["content"]: document for document in documents}
 
-        duplicate_count = (
-            len(documents)
-            - len(unique_documents)
-        )
+        duplicate_count = len(documents) - len(unique_documents)
 
         skipped += duplicate_count
 
-        documents = list(
-            unique_documents.values()
-        )
+        documents = list(unique_documents.values())
 
-        print(
-            f"Loaded {len(documents)} "
-            f"documents after deduplication"
-        )
+        print(f"Loaded {len(documents)} documents after deduplication")
 
         for document in documents:
             try:
-                result = self._write_markdown(
-                    document
-                )
+                result = self._write_markdown(document)
 
                 status = result["status"]
                 file_path = result["file"]
@@ -1382,19 +1240,12 @@ class UVARCMarkdownKnowledgeDataManager:
                 elif status == "unchanged":
                     unchanged += 1
 
-                print(
-                    f"{status.capitalize()}: "
-                    f"{file_path.name}"
-                )
+                print(f"{status.capitalize()}: {file_path.name}")
 
             except Exception as error:
                 failed += 1
 
-                print(
-                    f"Failed to write "
-                    f"{document['source']}: "
-                    f"{error}"
-                )
+                print(f"Failed to write {document['source']}: {error}")
 
         return build_generation_result(
             fetched=len(markdown_files),
@@ -1406,44 +1257,30 @@ class UVARCMarkdownKnowledgeDataManager:
             changed_files=changed_files,
         )
 
+
 # Open WebUI Knowledge Base
 
+
 class UVARCKnowledgeBaseManager:
-
     def __init__(self):
-        self.open_webui_url = os.getenv(
-            "OPENWEBUI_URL"
-        )
+        self.open_webui_url = os.getenv("OPENWEBUI_URL")
 
-        self.api_key = os.getenv(
-            "OPENWEBUI_API_KEY"
-        )
+        self.api_key = os.getenv("OPENWEBUI_API_KEY")
 
-        self.knowledge_base_id = os.getenv(
-            "OPENWEBUI_KB_ID"
-        )
+        self.knowledge_base_id = os.getenv("OPENWEBUI_KB_ID")
 
-        self.headers = {
-            "Authorization": (
-                f"Bearer {self.api_key}"
-            )
-        }
+        self.headers = {"Authorization": (f"Bearer {self.api_key}")}
 
     def upload_file(self, file_path):
 
         file_path = Path(file_path)
 
-        print(
-            f"Uploading: {file_path.name}"
-        )
+        print(f"Uploading: {file_path.name}")
 
         try:
             with open(file_path, "rb") as file:
                 response = requests.post(
-                    (
-                        f"{self.open_webui_url}"
-                        "/api/v1/files/"
-                    ),
+                    (f"{self.open_webui_url}/api/v1/files/"),
                     headers=self.headers,
                     files={
                         "file": (
@@ -1452,24 +1289,16 @@ class UVARCKnowledgeBaseManager:
                             "text/plain",
                         )
                     },
-                    data={
-                        "metadata": "{}"
-                    },
+                    data={"metadata": "{}"},
                 )
 
             if response.status_code not in (
                 200,
                 201,
             ):
-                print(
-                    "  ERROR uploading file "
-                    f"(HTTP "
-                    f"{response.status_code})"
-                )
+                print(f"  ERROR uploading file (HTTP {response.status_code})")
 
-                print(
-                    f"  {response.text}"
-                )
+                print(f"  {response.text}")
 
                 return None
 
@@ -1477,20 +1306,14 @@ class UVARCKnowledgeBaseManager:
 
             file_id = result.get("id")
 
-            print(
-                "  Uploaded successfully."
-            )
+            print("  Uploaded successfully.")
 
-            print(
-                f"  File ID: {file_id}"
-            )
+            print(f"  File ID: {file_id}")
 
             return file_id
 
         except Exception as error:
-            print(
-                f"  ERROR: {error}"
-            )
+            print(f"  ERROR: {error}")
 
             return None
 
@@ -1500,10 +1323,7 @@ class UVARCKnowledgeBaseManager:
         file_name,
     ):
 
-        print(
-            f"  Adding {file_name} "
-            "to Knowledge Base..."
-        )
+        print(f"  Adding {file_name} to Knowledge Base...")
 
         try:
             response = requests.post(
@@ -1515,41 +1335,26 @@ class UVARCKnowledgeBaseManager:
                 ),
                 headers={
                     **self.headers,
-                    "Content-Type":
-                        "application/json",
+                    "Content-Type": "application/json",
                 },
-                json={
-                    "file_id": file_id
-                },
+                json={"file_id": file_id},
             )
 
             if response.status_code not in (
                 200,
                 201,
             ):
-                print(
-                    "  ERROR adding to "
-                    "Knowledge Base "
-                    f"(HTTP "
-                    f"{response.status_code})"
-                )
+                print(f"  ERROR adding to Knowledge Base (HTTP {response.status_code})")
 
-                print(
-                    f"  {response.text}"
-                )
+                print(f"  {response.text}")
 
                 return False
 
-            print(
-                "  Added to Knowledge Base "
-                "successfully."
-            )
+            print("  Added to Knowledge Base successfully.")
 
             return True
 
         except Exception as error:
-            print(
-                f"  ERROR: {error}"
-            )
+            print(f"  ERROR: {error}")
 
             return False

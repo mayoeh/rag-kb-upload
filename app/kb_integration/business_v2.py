@@ -66,8 +66,21 @@ class RCKBKnowledgeManager:
             "file": file_path,
         }
 
-    def sanitize_filename(filename):
-        return
+    # Given the title of a source, transform it to a usable, safe filename
+    def generate_sanitized_filename(name, maxLength, hasSpaces):
+        if not name:
+            return ""
+
+        # specifically for sources whose titles may contain spaces (video/wiki/jira)
+        # if it doesnt, it is likely a website url that needs to be sanitzied in a special manner
+        if hasSpaces:
+            filename = re.sub(r"[^a-zA-Z0-9_\-]", "_", name)
+            filename = re.sub(r"_+", "_", filename).strip("_")
+        else:
+            filename = re.sub(r"[^a-zA-Z0-9_\-]", "_", name)
+            filename = re.sub(r"_+", "_", filename).strip("_")
+
+        return filename[:maxLength]
 
     def _scrub_pii(text):
         return

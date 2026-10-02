@@ -145,6 +145,11 @@ class RCKBKnowledgeManager:
     ############################
 
     # Website Logic
+    def _generate_website_knowledge(self):
+        scraper = cloudscraper.create_scraper()
+        visited = set()
+        self.crawl(scraper, "https://rc.virginia.edu/", visited)
+        self.crawl(scraper, "https://learning.rc.virginia.edu/", visited)
 
     def _is_valid(url):
 
@@ -175,28 +180,28 @@ class RCKBKnowledgeManager:
             and not path.endswith(SKIP_EXTENSIONS)
         )
 
-    def _crawl(self, url, netloc=None):
+    def _crawl(self, scraper, url, visited, netloc=None):
 
-        if url in self.visited:
-            return self.documents
-        self.visited.add(url)
+        if url in visited:
+            return
+        visited.add(url)
 
         netloc = netloc or urlparse(url).netloc
 
         try:
-            response = self.scraper.get(url, timeout=15)
+            response = scraper.get(url, timeout=15)
 
             if response.url != url:
                 url = response.url
-                if url in self.visited:
-                    return self.documents
-                self.visited.add(url)
+                if url in visited:
+                    return
+                visited.add(url)
 
             content_type = response.headers.get("Content-Type", "")
             if "text/html" not in content_type:
-                return self.documents
+                return
             if response.status_code != 200:
-                return self.documents
+                return
 
             soup = BeautifulSoup(response.text, "html.parser")
 
@@ -235,12 +240,10 @@ class RCKBKnowledgeManager:
                 if metadata_tag:
                     metadata_tag.decompose()
 
-                raw_text = article_soup.get_text()
+                clean_text = self.clean_markdown_text(article_soup.get_text())
+                safe_filename = self.generate_sanitized_filename(url)
 
-                self.documents[url] = {
-                    "text": self.clean_markdown_text(raw_text),
-                    "source": url,
-                }
+                self.save_document(safe_filename, clean_text)
                 print(f"Extracted: {url}")
 
             for a_tag in soup.find_all("a", href=True):
@@ -249,12 +252,10 @@ class RCKBKnowledgeManager:
                     next_url = urljoin(url, next_url)
                 next_url = next_url.split("#")[0]
 
-                if next_url not in self.visited and self.is_valid(next_url):
-                    self.crawl(next_url, netloc)
+                if next_url not in visited and self.is_valid(next_url):
+                    self._crawl(scraper, next_url, visited, netloc)
 
             time.sleep(0.2)
 
         except Exception as e:
             print(f"Failed to crawl {url}: {e}")
-
-        return self.documents

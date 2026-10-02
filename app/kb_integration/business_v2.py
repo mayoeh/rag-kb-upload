@@ -28,7 +28,7 @@ class RCKBKnowledgeManager:
         )
 
     ############################
-    ######UTILITY METHODS#######
+    #     UTILITY METHODS      #
     ############################
 
     def build_generation_result(
@@ -66,8 +66,12 @@ class RCKBKnowledgeManager:
         # specifically for sources whose titles may contain spaces (video/wiki/jira)
         # if it doesnt, it is likely a website url that needs to be sanitzied in a special manner
         if hasSpaces:
-            filename = re.sub(r"[^a-zA-Z0-9_\-]", "_", name)
-            filename = re.sub(r"_+", "_", filename).strip("_")
+            filename = re.sub(r'[<>:"/\\|?*]', "_", name)
+            filename = re.sub(
+                r"\s+",
+                " ",
+                filename,
+            ).strip()
         else:
             filename = re.sub(r"[^a-zA-Z0-9_\-]", "_", name)
             filename = re.sub(r"_+", "_", filename).strip("_")
@@ -118,6 +122,10 @@ class RCKBKnowledgeManager:
         if not text:
             return ""
 
+        # Specifically important for Website text cleanup
+        text = re.sub(r"https?:\/\/\S+?\.png", "", text)
+        text = re.sub(r"\S+\.png", "", text)
+
         text = re.sub(r"\n{3,}", "\n\n", text)
         text = re.sub(r"[ \t]+", " ", text)
         return text.strip() + "\n"
@@ -131,3 +139,122 @@ class RCKBKnowledgeManager:
         text = re.sub(r"<[^>]+>", "", text)
         text = unescape(text)
         return self.clean_markdown_text(text)
+
+    ############################
+    #    MAIN SCRAPER LOGIC    #
+    ############################
+
+    # Website Logic
+
+    def _is_valid(url):
+
+        SKIP_EXTENSIONS = (
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".bmp",
+            ".svg",
+            ".pdf",
+            ".zip",
+            ".tar",
+            ".gz",
+            ".mp4",
+            ".webp",
+        )
+        ALLOWED_NETLOCS = {
+            "rc.virginia.edu",
+            "learning.rc.virginia.edu",
+            "archive.rc.virginia.edu",
+        }
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        return (
+            parsed.scheme in {"http", "https"}
+            and parsed.netloc in ALLOWED_NETLOCS
+            and not path.endswith(SKIP_EXTENSIONS)
+        )
+
+    def _crawl(self, url, netloc=None):
+
+        if url in self.visited:
+            return self.documents
+        self.visited.add(url)
+
+        netloc = netloc or urlparse(url).netloc
+
+        try:
+            response = self.scraper.get(url, timeout=15)
+
+            if response.url != url:
+                url = response.url
+                if url in self.visited:
+                    return self.documents
+                self.visited.add(url)
+
+            content_type = response.headers.get("Content-Type", "")
+            if "text/html" not in content_type:
+                return self.documents
+            if response.status_code != 200:
+                return self.documents
+
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            if len(articles := soup.find_all("article")) != 1:
+                print(f"Skipping {url} (no single article)")
+            else:
+                article_soup = BeautifulSoup(str(articles[0]), "html.parser")
+
+                for tag in article_soup.find_all("img"):
+                    tag.decompose()
+
+                return_link = article_soup.find(
+                    "a", string=re.compile(r"^\u00ab Return to")
+                )
+                if return_link:
+                    return_link.decompose()
+
+                metadata_tag = article_soup.find("p", class_="blog-post-meta")
+
+                for a_tag in article_soup.find_all("a", href=True):
+                    href = a_tag["href"]
+                    if not href.startswith("http"):
+                        href = urljoin(url, href)
+                    a_tag["href"] = href
+                    a_tag.string = f"[{a_tag.get_text(strip=True)}]({href})"
+
+                title_tag = article_soup.find("h2", class_="blog-post-title")
+                if title_tag:
+                    title_text = title_tag.get_text(strip=True)
+                    title_tag.string = f"# {title_text}\n\n"
+
+                for h1_tag in article_soup.find_all("h1"):
+                    h1_text = h1_tag.get_text(strip=True)
+                    h1_tag.string = f"\n\n## {h1_text}\n"
+
+                if metadata_tag:
+                    metadata_tag.decompose()
+
+                raw_text = article_soup.get_text()
+
+                self.documents[url] = {
+                    "text": self.clean_markdown_text(raw_text),
+                    "source": url,
+                }
+                print(f"Extracted: {url}")
+
+            for a_tag in soup.find_all("a", href=True):
+                next_url = a_tag["href"]
+                if not next_url.startswith(("http://", "https://")):
+                    next_url = urljoin(url, next_url)
+                next_url = next_url.split("#")[0]
+
+                if next_url not in self.visited and self.is_valid(next_url):
+                    self.crawl(next_url, netloc)
+
+            time.sleep(0.2)
+
+        except Exception as e:
+            print(f"Failed to crawl {url}: {e}")
+
+        return self.documents

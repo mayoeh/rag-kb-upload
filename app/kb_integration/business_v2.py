@@ -27,7 +27,54 @@ class RCKBKnowledgeManager:
             exist_ok=True,
         )
 
-    # Utility Methods
+    ############################
+    ######UTILITY METHODS#######
+    ############################
+
+    def build_generation_result(
+        fetched,
+        created,
+        updated,
+        unchanged,
+        skipped,
+        failed,
+        changed_files,
+    ):
+        print("KNOWLEDGE GENERATION COMPLETE")
+        print(f"Fetched:   {fetched}")
+        print(f"Created:   {created}")
+        print(f"Updated:   {updated}")
+        print(f"Unchanged: {unchanged}")
+        print(f"Skipped:   {skipped}")
+        print(f"Failed:    {failed}")
+
+        return {
+            "fetched": fetched,
+            "created": created,
+            "updated": updated,
+            "unchanged": unchanged,
+            "skipped": skipped,
+            "failed": failed,
+            "changed_files": changed_files,
+        }
+
+    # Given the title of a source, transform it to a usable, safe filename
+    def generate_sanitized_filename(self, name, maxLength, hasSpaces):
+        if not name:
+            return ""
+
+        # specifically for sources whose titles may contain spaces (video/wiki/jira)
+        # if it doesnt, it is likely a website url that needs to be sanitzied in a special manner
+        if hasSpaces:
+            filename = re.sub(r"[^a-zA-Z0-9_\-]", "_", name)
+            filename = re.sub(r"_+", "_", filename).strip("_")
+        else:
+            filename = re.sub(r"[^a-zA-Z0-9_\-]", "_", name)
+            filename = re.sub(r"_+", "_", filename).strip("_")
+
+        return filename[:maxLength]
+
+    # Atomic Saving utility used by scrapers to generate update summaries
     def save_document(self, filename, content):
         file_path = self.output_folder / filename
 
@@ -66,21 +113,21 @@ class RCKBKnowledgeManager:
             "file": file_path,
         }
 
-    # Given the title of a source, transform it to a usable, safe filename
-    def generate_sanitized_filename(name, maxLength, hasSpaces):
-        if not name:
+    # Cleaning text using common regex patterns and removing whitespace
+    def clean_markdown_text(self, text):
+        if not text:
             return ""
 
-        # specifically for sources whose titles may contain spaces (video/wiki/jira)
-        # if it doesnt, it is likely a website url that needs to be sanitzied in a special manner
-        if hasSpaces:
-            filename = re.sub(r"[^a-zA-Z0-9_\-]", "_", name)
-            filename = re.sub(r"_+", "_", filename).strip("_")
-        else:
-            filename = re.sub(r"[^a-zA-Z0-9_\-]", "_", name)
-            filename = re.sub(r"_+", "_", filename).strip("_")
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"[ \t]+", " ", text)
+        return text.strip() + "\n"
 
-        return filename[:maxLength]
-
-    def _scrub_pii(text):
-        return
+    def strip_html_tags(self, html):
+        if not html:
+            return ""
+        text = re.sub(r"<br\s*/?>", "\n", html)
+        text = re.sub(r"</p>", "\n", text)
+        text = re.sub(r"</li>", "\n", text)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = unescape(text)
+        return self.clean_markdown_text(text)

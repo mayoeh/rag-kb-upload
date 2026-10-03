@@ -150,9 +150,10 @@ class RCKBKnowledgeManager:
         visited = set()
         self.crawl(scraper, "https://rc.virginia.edu/", visited)
         self.crawl(scraper, "https://learning.rc.virginia.edu/", visited)
+        self.fill_sitemap_gaps()
+        self.patch_js_rendered_pages()
 
     def _is_valid(url):
-
         SKIP_EXTENSIONS = (
             ".png",
             ".jpg",
@@ -357,3 +358,32 @@ class RCKBKnowledgeManager:
                 print(f"Failed {url}: {e}")
 
         print("Fully done filling sitemap gaps!")
+
+    def patch_js_rendered_pages(self):
+        manual_patches = {
+            "https://rc.virginia.edu/userinfo/hpc/slurm-script-generator/": {
+                "text": "# Slurm Script Generator\n\nThe UVA Research Computing Slurm Script Generator...",
+                "source": "https://rc.virginia.edu/userinfo/hpc/slurm-script-generator/",
+            },
+            "https://rc.virginia.edu/userinfo/hpc/software/physics/": {
+                "text": "# Physics Software on UVA HPC\n\nUVA Research Computing provides several physics...",
+                "source": "https://rc.virginia.edu/userinfo/hpc/software/physics/",
+            },
+        }
+
+        patched = 0
+        for url, doc in manual_patches.items():
+            filename = f"{self.generate_sanitized_filename(url)}"
+            file_path = self.output_folder / filename
+            if (
+                not file_path.exists()
+                or file_path.stat().st_size == 0
+                or len(self.documents.get(url, {}).get("text", "")) < 100
+            ):
+                self.save_document(filename, doc)
+                patched += 1
+                print(f"Patched: {url}")
+            else:
+                print(f"Already has content: {url}")
+
+        print(f"\nManually patched {patched} JS-rendered pages.")

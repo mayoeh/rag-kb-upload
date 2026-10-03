@@ -259,3 +259,101 @@ class RCKBKnowledgeManager:
 
         except Exception as e:
             print(f"Failed to crawl {url}: {e}")
+
+    def _get_sitemap_urls(self, sitemap_url, skip_patterns=None):
+        skip_patterns = skip_patterns or []
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+        print(f"Fetching sitemap: {sitemap_url}")
+        resp = self.scraper.get(sitemap_url, timeout=15)
+        resp.raise_for_status()
+
+        print(f"  Status: {resp.status_code}")
+        print(f"  Content-Type: {resp.headers.get('Content-Type')}")
+
+        try:
+            root = ET.fromstring(resp.text)
+        except ET.ParseError as e:
+            print(f"  Could not parse sitemap XML: {e}")
+            print(f"  Response starts with: {resp.text[:300]!r}")
+            return []
+
+        base = "https://" + sitemap_url.split("/")[2]
+        raw = []
+
+        for url in root.findall("sm:url", ns):
+            loc = url.find("sm:loc", ns)
+            if loc is not None and loc.text:
+                raw.append(loc.text.strip())
+
+        urls = [base + u if u.startswith("/") else u for u in raw]
+        urls = [u for u in urls if not any(pattern in u for pattern in skip_patterns)]
+
+        print(f"  Found {len(urls)} URLs")
+        return urls
+
+    def _extract_article(self, scraper, url):
+        response = scraper.get(url, timeout=15)
+        if response.status_code != 200 or "text/html" not in response.headers.get(
+            "Content-Type", ""
+        ):
+            return None
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        articles = soup.find_all("article")
+        if len(articles) != 1:
+            return None
+
+        article_soup = BeautifulSoup(str(articles[0]), "html.parser")
+
+        for tag in article_soup.find_all("img"):
+            tag.decompose()
+
+        metadata_tag = article_soup.find("p", class_="blog-post-meta")
+
+        for a_tag in article_soup.find_all("a", href=True):
+            href = a_tag["href"]
+            if not href.startswith("http"):
+                href = urljoin(url, href)
+            a_tag["href"] = href
+            a_tag.string = "[" + a_tag.get_text(strip=True) + "](" + href + ")"
+
+        if metadata_tag:
+            metadata_tag.decompose()
+
+        text = article_soup.get_text()
+        clean_text = self.clean_markdown_text(text)
+
+        return {"text": clean_text, "filename": self.generate_sanitized_filename(url)}
+
+    def fill_sitemap_gaps(self):
+        rc_urls = self.get_sitemap_urls("https://rc.virginia.edu/sitemap.xml")
+        learn_urls = self.get_sitemap_urls(
+            "https://learning.rc.virginia.edu/sitemap.xml", self.SKIP_PATTERNS
+        )
+        all_sitemap_urls = rc_urls + learn_urls
+
+        missing = []
+        for url in all_sitemap_urls:
+            filename = f"{self.generate_sanitized_filename(url)}.md"
+            file_path = self.output_folder / filename
+
+            if not file_path.exists() or file_path.stat().st_size == 0:
+                missing.append(url)
+        print(
+            f"Sitemap total: {len(all_sitemap_urls)}, already crawled: {len(all_sitemap_urls) - len(missing)}, missing: {len(missing)}"
+        )
+
+        for url in missing:
+            try:
+                result = self._extract_article(url)
+                if result:
+                    self.save_document(result["filename"], result["text"])
+                    print(f"Added: {url}")
+                else:
+                    print(f"Skipped (no article): {url}")
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"Failed {url}: {e}")
+
+        print("Fully done filling sitemap gaps!")

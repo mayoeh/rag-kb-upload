@@ -7,138 +7,472 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import cloudscraper
-import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from jira import JIRA
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
-from youtube_transcript_api import YouTubeTranscriptApi
-from yt_dlp import YoutubeDL
 
 load_dotenv()
 
 
-class UVARCLocalKnowledgeDataManager:
+class RCKBKnowledgeManager:
+    ############################
+    #      CONFIGURATION       #
+    ############################
+
+    # Website crawl
+    WEBSITE_SEEDS = (
+        "https://rc.virginia.edu/",
+        "https://learning.rc.virginia.edu/",
+    )
+    RC_SITEMAP = "https://rc.virginia.edu/sitemap.xml"
+    LEARNING_SITEMAP = "https://learning.rc.virginia.edu/sitemap.xml"
+    ALLOWED_NETLOCS = {
+        "rc.virginia.edu",
+        "learning.rc.virginia.edu",
+        "archive.rc.virginia.edu",
+    }
+    SKIP_EXTENSIONS = (
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".svg",
+        ".pdf",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".mp4",
+        ".webp",
+    )
+    # URL substrings to ignore in the learning.rc sitemap (e.g. "/tags/")
+    SKIP_PATTERNS = []
+    REQUEST_DELAY = 0.2  # seconds between page requests
+    BLOCKED_STATUSES = (403, 429, 503)
+
+    # JIRA
+    UVA_ID_RE = re.compile(
+        r"\b[a-z]{2,4}\d{1,2}[a-z0-9]{1,3}\b",
+        re.IGNORECASE,
+    )
+    JIRA_BASE_FILTER = (
+        "project IN (SUP, RIV, IVY, ACCORDSUP) "
+        "AND type != Sub-task "
+        'AND "Request Type[Dropdown]" != "Provisioning/Deprovisioning" '
+        "AND status != Open "
+    )
+
     def __init__(self, output_folder):
         self.output_folder = Path(output_folder)
-        self.output_folder.mkdir(
-            parents=True,
-            exist_ok=True,
+        self.output_folder.mkdir(parents=True, exist_ok=True)
+
+        # rc.virginia.edu intermittently returns 403s to automated requests
+        # (bot protection). Pin one browser profile so every run looks the
+        # same, and retry blocked requests with backoff (see _fetch).
+        self.scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "desktop": True}
         )
 
+        # Created on first use, so website-only runs don't need JIRA
+        # credentials or the Presidio models.
+        self._jira = None
+        self._analyzer = None
+        self._anonymizer = None
+
+    @property
+    def jira(self):
+        if self._jira is None:
+            self._jira = JIRA(
+                server=os.getenv("JIRA_SERVER"),
+                basic_auth=(os.getenv("JIRA_EMAIL"), os.getenv("JIRA_API_TOKEN")),
+            )
+        return self._jira
+
+    @property
+    def analyzer(self):
+        if self._analyzer is None:
+            self._analyzer = AnalyzerEngine()
+        return self._analyzer
+
+    @property
+    def anonymizer(self):
+        if self._anonymizer is None:
+            self._anonymizer = AnonymizerEngine()
+        return self._anonymizer
+
+    ############################
+    #     UTILITY METHODS      #
+    ############################
+
+    @staticmethod
+    def _new_stats():
+        return {
+            "fetched": 0,
+            "created": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "skipped": 0,
+            "failed": 0,
+            "changed_files": [],
+        }
+
+    @staticmethod
+    def _record(stats, result):
+        # Tally a save_document() result into a stats dict
+        status = result["status"]
+        stats[status] += 1
+        if status in ("created", "updated"):
+            stats["changed_files"].append(result["file"])
+
+    def build_generation_result(
+        self,
+        fetched,
+        created,
+        updated,
+        unchanged,
+        skipped,
+        failed,
+        changed_files,
+    ):
+        print("KNOWLEDGE GENERATION COMPLETE")
+        print(f"Fetched:   {fetched}")
+        print(f"Created:   {created}")
+        print(f"Updated:   {updated}")
+        print(f"Unchanged: {unchanged}")
+        print(f"Skipped:   {skipped}")
+        print(f"Failed:    {failed}")
+
+        return {
+            "fetched": fetched,
+            "created": created,
+            "updated": updated,
+            "unchanged": unchanged,
+            "skipped": skipped,
+            "failed": failed,
+            "changed_files": changed_files,
+        }
+
+    # Given the title of a source, transform it to a usable, safe filename
+    def generate_sanitized_filename(self, name, maxLength=200, hasSpaces=False):
+        if not name:
+            return ""
+
+        # Sources whose titles may contain spaces (video/wiki/jira) keep them;
+        # otherwise it is likely a website URL, sanitized to underscores.
+        if hasSpaces:
+            filename = re.sub(r'[<>:"/\\|?*]', "_", name)
+            filename = re.sub(r"\s+", " ", filename).strip()
+        else:
+            filename = re.sub(r"[^a-zA-Z0-9_\-]", "_", name)
+            filename = re.sub(r"_+", "_", filename).strip("_")
+
+        return filename[:maxLength]
+
+    # Saving utility used by scrapers to generate update summaries
     def save_document(self, filename, content):
+        if not filename.endswith(".md"):
+            filename += ".md"
         file_path = self.output_folder / filename
 
         content = content.strip() + "\n"
 
         # New document
         if not file_path.exists():
-            file_path.write_text(
-                content,
-                encoding="utf-8",
-            )
-
-            return {
-                "status": "created",
-                "file": file_path,
-            }
-
-        # Existing document
-        existing_content = file_path.read_text(encoding="utf-8")
+            file_path.write_text(content, encoding="utf-8")
+            return {"status": "created", "file": file_path}
 
         # Nothing changed
-        if existing_content == content:
-            return {
-                "status": "unchanged",
-                "file": file_path,
-            }
+        if file_path.read_text(encoding="utf-8") == content:
+            return {"status": "unchanged", "file": file_path}
 
         # Content changed
-        file_path.write_text(
-            content,
-            encoding="utf-8",
+        file_path.write_text(content, encoding="utf-8")
+        return {"status": "updated", "file": file_path}
+
+    # Cleaning text using common regex patterns and removing whitespace
+    def clean_markdown_text(self, text):
+        if not text:
+            return ""
+
+        # Specifically important for website text cleanup
+        text = re.sub(r"https?:\/\/\S+?\.png", "", text)
+        text = re.sub(r"\S+\.png", "", text)
+
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"[ \t]+", " ", text)
+        return text.strip() + "\n"
+
+    def strip_html_tags(self, html):
+        if not html:
+            return ""
+        text = re.sub(r"<br\s*/?>", "\n", html)
+        text = re.sub(r"</p>", "\n", text)
+        text = re.sub(r"</li>", "\n", text)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = unescape(text)
+        return self.clean_markdown_text(text)
+
+    ############################
+    #       WEBSITE LOGIC      #
+    ############################
+
+    def generate_website_knowledge(self):
+        print("Starting website knowledge generation...")
+        stats = self._new_stats()
+        visited = set()
+
+        for seed in self.WEBSITE_SEEDS:
+            self._crawl(seed, visited, stats)
+
+        self.fill_sitemap_gaps(stats)
+        self.patch_js_rendered_pages(stats)
+
+        return self.build_generation_result(**stats)
+
+    def _is_valid(self, url):
+        parsed = urlparse(url)
+        return (
+            parsed.scheme in {"http", "https"}
+            and parsed.netloc in self.ALLOWED_NETLOCS
+            and not parsed.path.lower().endswith(self.SKIP_EXTENSIONS)
         )
 
-        return {
-            "status": "updated",
-            "file": file_path,
+    def _doc_path(self, url):
+        return self.output_folder / f"{self.generate_sanitized_filename(url)}.md"
+
+    def _fetch(self, url, retries=3):
+        # Retry requests that bot protection or rate limiting turned away
+        for attempt in range(retries):
+            response = self.scraper.get(url, timeout=15)
+            if response.status_code not in self.BLOCKED_STATUSES:
+                return response
+            wait = 5 * (attempt + 1)
+            print(f"  [{response.status_code}] blocked on {url}, retrying in {wait}s")
+            time.sleep(wait)
+        return response
+
+    def _parse_article(self, soup, url):
+        # Returns cleaned Markdown for the page's single <article>, or None
+        articles = soup.find_all("article")
+        if len(articles) != 1:
+            return None
+
+        article = BeautifulSoup(str(articles[0]), "html.parser")
+
+        for tag in article.find_all("img"):
+            tag.decompose()
+
+        return_link = article.find("a", string=re.compile(r"^\u00ab Return to"))
+        if return_link:
+            return_link.decompose()
+
+        metadata_tag = article.find("p", class_="blog-post-meta")
+        if metadata_tag:
+            metadata_tag.decompose()
+
+        for a_tag in article.find_all("a", href=True):
+            href = a_tag["href"]
+            if not href.startswith("http"):
+                href = urljoin(url, href)
+            a_tag["href"] = href
+            a_tag.string = f"[{a_tag.get_text(strip=True)}]({href})"
+
+        title_tag = article.find("h2", class_="blog-post-title")
+        if title_tag:
+            title_tag.string = f"# {title_tag.get_text(strip=True)}\n\n"
+
+        for h1_tag in article.find_all("h1"):
+            h1_tag.string = f"\n\n## {h1_tag.get_text(strip=True)}\n"
+
+        return self.clean_markdown_text(article.get_text())
+
+    def _crawl(self, url, visited, stats=None):
+        if stats is None:
+            stats = self._new_stats()
+
+        if url in visited:
+            return stats
+        visited.add(url)
+
+        try:
+            response = self._fetch(url)
+
+            if response.url != url:
+                url = response.url
+                if url in visited:
+                    return stats
+                visited.add(url)
+
+            if response.status_code != 200:
+                print(f"Skipping {url} (status {response.status_code})")
+                if response.status_code in self.BLOCKED_STATUSES:
+                    stats["failed"] += 1
+                else:
+                    stats["skipped"] += 1
+                return stats
+
+            if "text/html" not in response.headers.get("Content-Type", ""):
+                return stats
+
+            stats["fetched"] += 1
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            text = self._parse_article(soup, url)
+            if text is None:
+                print(f"Skipping {url} (no single article)")
+                stats["skipped"] += 1
+            else:
+                result = self.save_document(self.generate_sanitized_filename(url), text)
+                self._record(stats, result)
+                print(f"Extracted ({result['status']}): {url}")
+
+            # Follow links from the whole page, not just the article
+            for a_tag in soup.find_all("a", href=True):
+                next_url = urljoin(url, a_tag["href"]).split("#")[0]
+                if next_url not in visited and self._is_valid(next_url):
+                    self._crawl(next_url, visited, stats)
+
+            time.sleep(self.REQUEST_DELAY)
+
+        except Exception as e:
+            stats["failed"] += 1
+            print(f"Failed to crawl {url}: {e}")
+
+        return stats
+
+    def _get_sitemap_urls(self, sitemap_url, skip_patterns=None):
+        skip_patterns = skip_patterns or []
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+        print(f"Fetching sitemap: {sitemap_url}")
+        resp = self._fetch(sitemap_url)
+        if resp.status_code != 200:
+            print(f"  Could not fetch sitemap (status {resp.status_code})")
+            return []
+
+        try:
+            root = ET.fromstring(resp.text)
+        except ET.ParseError as e:
+            print(f"  Could not parse sitemap XML: {e}")
+            print(f"  Response starts with: {resp.text[:300]!r}")
+            return []
+
+        base = "https://" + urlparse(sitemap_url).netloc
+        raw = [
+            loc.text.strip()
+            for entry in root.findall("sm:url", ns)
+            if (loc := entry.find("sm:loc", ns)) is not None and loc.text
+        ]
+
+        urls = [base + u if u.startswith("/") else u for u in raw]
+        urls = [u for u in urls if not any(p in u for p in skip_patterns)]
+
+        print(f"  Found {len(urls)} URLs")
+        return urls
+
+    def fill_sitemap_gaps(self, stats=None):
+        # Catch orphan pages the link crawl never reached
+        if stats is None:
+            stats = self._new_stats()
+
+        all_sitemap_urls = self._get_sitemap_urls(
+            self.RC_SITEMAP
+        ) + self._get_sitemap_urls(self.LEARNING_SITEMAP, self.SKIP_PATTERNS)
+
+        missing = []
+        for url in all_sitemap_urls:
+            path = self._doc_path(url)
+            if not path.exists() or path.stat().st_size == 0:
+                missing.append(url)
+
+        print(
+            f"Sitemap total: {len(all_sitemap_urls)}, "
+            f"already crawled: {len(all_sitemap_urls) - len(missing)}, "
+            f"missing: {len(missing)}"
+        )
+
+        for url in missing:
+            try:
+                response = self._fetch(url)
+                if response.status_code != 200 or "text/html" not in response.headers.get(
+                    "Content-Type", ""
+                ):
+                    print(f"Skipped (status {response.status_code}): {url}")
+                    stats["skipped"] += 1
+                    continue
+
+                stats["fetched"] += 1
+                soup = BeautifulSoup(response.text, "html.parser")
+                text = self._parse_article(soup, url)
+
+                if text is None:
+                    print(f"Skipped (no article): {url}")
+                    stats["skipped"] += 1
+                else:
+                    result = self.save_document(
+                        self.generate_sanitized_filename(url), text
+                    )
+                    self._record(stats, result)
+                    print(f"Added: {url}")
+
+                time.sleep(self.REQUEST_DELAY)
+
+            except Exception as e:
+                stats["failed"] += 1
+                print(f"Failed {url}: {e}")
+
+        print("Finished filling sitemap gaps.")
+        return stats
+
+    def patch_js_rendered_pages(self, stats=None):
+        # Pages whose content is rendered by JavaScript, so the crawler
+        # can't see it. Text is maintained by hand here.
+        if stats is None:
+            stats = self._new_stats()
+
+        manual_patches = {
+            "https://rc.virginia.edu/userinfo/hpc/slurm-script-generator/": (
+                "# Slurm Script Generator\n\n"
+                "The UVA Research Computing Slurm Script Generator..."
+            ),
+            "https://rc.virginia.edu/userinfo/hpc/software/physics/": (
+                "# Physics Software on UVA HPC\n\n"
+                "UVA Research Computing provides several physics..."
+            ),
         }
 
+        patched = 0
+        for url, text in manual_patches.items():
+            path = self._doc_path(url)
+            if path.exists() and path.stat().st_size >= 100:
+                print(f"Already has content: {url}")
+                continue
 
-def build_generation_result(
-    fetched,
-    created,
-    updated,
-    unchanged,
-    skipped,
-    failed,
-    changed_files,
-):
-    print("KNOWLEDGE GENERATION COMPLETE")
-    print(f"Fetched:   {fetched}")
-    print(f"Created:   {created}")
-    print(f"Updated:   {updated}")
-    print(f"Unchanged: {unchanged}")
-    print(f"Skipped:   {skipped}")
-    print(f"Failed:    {failed}")
+            result = self.save_document(self.generate_sanitized_filename(url), text)
+            self._record(stats, result)
+            patched += 1
+            print(f"Patched: {url}")
 
-    return {
-        "fetched": fetched,
-        "created": created,
-        "updated": updated,
-        "unchanged": unchanged,
-        "skipped": skipped,
-        "failed": failed,
-        "changed_files": changed_files,
-    }
+        print(f"Manually patched {patched} JS-rendered pages.")
+        return stats
 
+    ############################
+    #        JIRA LOGIC        #
+    ############################
 
-# Jira Knowledge
-class UVARCJiraKnowledgeDataManager:
-    # Handles all generation of JIRA knowledge base
+    def get_all_jira_issues(self):
+        # Initial population of the KB or full rebuild
+        jql = self.JIRA_BASE_FILTER + "ORDER BY updated DESC"
+        return self._fetch_issues(jql)
 
-    UVA_ID_RE = re.compile(
-        r"\b[a-z]{2,4}\d{1,2}[a-z0-9]{1,3}\b",
-        re.IGNORECASE,
-    )
-
-    def __init__(self, output_folder):
-        self.output_folder = Path(output_folder)
-
-        self.local_documents = UVARCLocalKnowledgeDataManager(output_folder)
-
-        self.server = os.getenv("JIRA_SERVER")
-        self.email = os.getenv("JIRA_EMAIL")
-        self.api_token = os.getenv("JIRA_API_TOKEN")
-        self.project_key = os.getenv("JIRA_PROJECT_KEY")
-
-        self.jira = JIRA(
-            server=self.server,
-            basic_auth=(
-                self.email,
-                self.api_token,
-            ),
-        )
-
-        self.analyzer = AnalyzerEngine()
-        self.anonymizer = AnonymizerEngine()
-
-    # JIRA retrieval
-
-    def get_resolved_issues(self):
-        jql = (
-            f"project = {self.project_key} "
-            "AND status = Resolved "
-            'AND created >= "2026-08-19" '
-            'AND created < "2026-08-26" '
-            "ORDER BY created DESC"
-        )
-
+    def get_recent_jira_issues(self):
+        # Incremental scrape for recently updated issues
+        jql = self.JIRA_BASE_FILTER + "AND updated >= -2d ORDER BY updated DESC"
         return self._fetch_issues(jql)
 
     def _fetch_issues(self, jql):
-
         issues = []
         next_page_token = None
 
@@ -146,70 +480,37 @@ class UVARCJiraKnowledgeDataManager:
             batch = self.jira.enhanced_search_issues(
                 jql,
                 maxResults=100,
-                fields=[
-                    "summary",
-                    "description",
-                    "comment",
-                ],
+                fields=["summary", "description", "comment"],
                 expand="renderedFields",
                 nextPageToken=next_page_token,
             )
-
             issues.extend(batch)
-
             print(f"Fetched {len(issues)} JIRA issues so far...")
 
-            next_page_token = getattr(
-                batch,
-                "nextPageToken",
-                None,
-            )
-
+            next_page_token = getattr(batch, "nextPageToken", None)
             if not next_page_token:
                 break
 
         return issues
 
     # Description processing
-
     def _get_description(self, issue):
-
         rendered_description = ""
 
         if hasattr(issue, "renderedFields"):
             rendered_description = (
-                getattr(
-                    issue.renderedFields,
-                    "description",
-                    "",
-                )
-                or ""
+                getattr(issue.renderedFields, "description", "") or ""
             )
 
         if not rendered_description:
             raw_description = issue.fields.description
-
             if isinstance(raw_description, str):
                 rendered_description = raw_description
 
-        return self._html_to_text(rendered_description)
+        return self.strip_html_tags(rendered_description)
 
     def _classify_description(self, description):
-        """
-        Determine which known JIRA description format is used.
-
-        form_with_description:
-            Structured form containing a useful Description field.
-
-        form_metadata:
-            Form containing primarily identifying/form metadata.
-            These tickets are skipped.
-
-        free_text:
-            Normal free-text support request.
-        """
-
-        if "Description: " in description or "Description:" in description:
+        if "Description:" in description:
             return "form_with_description"
 
         if description.strip().startswith("Name:") or "Uid:" in description[:200]:
@@ -218,208 +519,80 @@ class UVARCJiraKnowledgeDataManager:
         return "free_text"
 
     def _extract_form_description(self, description):
+        content = description.split("Description:", 1)[1]
 
-        if "Description: " in description:
-            content = description.split(
-                "Description: ",
-                1,
-            )[1]
-        else:
-            content = description.split(
-                "Description:",
-                1,
-            )[1]
-
-        for cutoff in [
-            "Classification: ",
-            "Classification:",
-        ]:
-            if cutoff in content:
-                content = content.split(
-                    cutoff,
-                    1,
-                )[0]
+        if "Classification:" in content:
+            content = content.split("Classification:", 1)[0]
 
         return content.strip()
 
     # Comment processing
-
     def _extract_comments(self, issue):
-
         raw_comments = []
-
         if hasattr(issue.fields, "comment") and issue.fields.comment:
             raw_comments = issue.fields.comment.comments
 
         rendered_comments = []
-
         if hasattr(issue, "renderedFields"):
-            rendered_comment_object = getattr(
-                issue.renderedFields,
-                "comment",
-                None,
-            )
-
+            rendered_comment_object = getattr(issue.renderedFields, "comment", None)
             if rendered_comment_object:
-                rendered_comments = getattr(
-                    rendered_comment_object,
-                    "comments",
-                    [],
-                )
+                rendered_comments = getattr(rendered_comment_object, "comments", [])
 
         comments = []
-
         for index, raw_comment in enumerate(raw_comments):
             author = "Unknown"
-
-            if hasattr(raw_comment, "author") and raw_comment.author:
+            if getattr(raw_comment, "author", None):
                 author = raw_comment.author.displayName
 
             rendered_body = ""
-
             if index < len(rendered_comments):
-                rendered_body = (
-                    getattr(
-                        rendered_comments[index],
-                        "body",
-                        "",
-                    )
-                    or ""
-                )
+                rendered_body = getattr(rendered_comments[index], "body", "") or ""
 
-            if not rendered_body:
-                if isinstance(
-                    raw_comment.body,
-                    str,
-                ):
-                    rendered_body = raw_comment.body
+            if not rendered_body and isinstance(raw_comment.body, str):
+                rendered_body = raw_comment.body
 
-            body = self._html_to_text(rendered_body)
-
+            body = self.strip_html_tags(rendered_body)
             if body:
-                comments.append(
-                    {
-                        "author": author,
-                        "body": body,
-                    }
-                )
+                comments.append({"author": author, "body": body})
 
         return comments
 
-    # Text cleanup / PII
-
-    def _html_to_text(self, html):
-        if not html:
-            return ""
-
-        text = re.sub(
-            r"<br\s*/?>",
-            "\n",
-            html,
-        )
-
-        text = re.sub(
-            r"</p>",
-            "\n",
-            text,
-        )
-
-        text = re.sub(
-            r"</li>",
-            "\n",
-            text,
-        )
-
-        text = re.sub(
-            r"<[^>]+>",
-            "",
-            text,
-        )
-
-        text = unescape(text)
-
-        text = re.sub(
-            r"\n{3,}",
-            "\n\n",
-            text,
-        )
-
-        return text.strip()
-
+    # PII scrubbing
     def _scrub_text(self, text):
-
         if not text:
             return text
 
         results = self.analyzer.analyze(
             text=text,
             language="en",
-            entities=[
-                "PERSON",
-                "EMAIL_ADDRESS",
-                "PHONE_NUMBER",
-            ],
+            entities=["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER"],
         )
+        text = self.anonymizer.anonymize(text=text, analyzer_results=results).text
 
-        text = self.anonymizer.anonymize(
-            text=text,
-            analyzer_results=results,
-        ).text
-
-        text = self.UVA_ID_RE.sub(
-            "<UVA_ID>",
-            text,
-        )
-
-        return text
-
-    def _clean_markdown_text(self, text):
-
-        if not text:
-            return ""
-
-        text = text.strip()
-
-        text = re.sub(
-            r"\n{3,}",
-            "\n\n",
-            text,
-        )
-
-        return text
+        return self.UVA_ID_RE.sub("<UVA_ID>", text)
 
     # Issue processing
-
     def _process_issue(self, issue):
-
         description = self._get_description(issue)
-
         if not description:
             return None
 
         ticket_type = self._classify_description(description)
-
-        # Type 2 tickets contain primarily form metadata
         if ticket_type == "form_metadata":
             return None
 
         if ticket_type == "form_with_description":
             description = self._extract_form_description(description)
+            if not description:
+                return None
 
-        if not description:
-            return None
-
-        comments = self._extract_comments(issue)
-
-        processed_comments = []
-
-        for comment in comments:
-            processed_comments.append(
-                {
-                    "author": self._scrub_text(comment["author"]),
-                    "body": self._scrub_text(comment["body"]),
-                }
-            )
+        processed_comments = [
+            {
+                "author": self._scrub_text(comment["author"]),
+                "body": self._scrub_text(comment["body"]),
+            }
+            for comment in self._extract_comments(issue)
+        ]
 
         return {
             "key": issue.key,
@@ -429,12 +602,9 @@ class UVARCJiraKnowledgeDataManager:
         }
 
     # Markdown generation
-
-    def _build_markdown(self, issue):
-
-        summary = self._clean_markdown_text(issue["summary"])
-
-        description = self._clean_markdown_text(issue["description"])
+    def _build_jira_markdown(self, issue):
+        summary = self.clean_markdown_text(issue["summary"]).strip()
+        description = self.clean_markdown_text(issue["description"]).strip()
 
         markdown = f"""# {summary}
 
@@ -455,10 +625,8 @@ class UVARCJiraKnowledgeDataManager:
             markdown += "\n---\n\n## Resolution and Discussion\n"
 
             comment_number = 1
-
             for comment in issue["comments"]:
-                body = self._clean_markdown_text(comment["body"])
-
+                body = self.clean_markdown_text(comment["body"]).strip()
                 if not body:
                     continue
 
@@ -468,893 +636,41 @@ class UVARCJiraKnowledgeDataManager:
 
 {body}
 """
-
                 comment_number += 1
 
         return markdown.strip() + "\n"
 
-    def _write_markdown(self, issue):
-
-        filename = f"jira_{issue['key']}.md"
-
-        markdown = self._build_markdown(issue)
-
-        return self.local_documents.save_document(
-            filename,
-            markdown,
+    def _save_jira_issue(self, issue):
+        return self.save_document(
+            f"jira_{issue['key']}.md",
+            self._build_jira_markdown(issue),
         )
 
-    def generate_knowledge_documents(self):
-        issues = self.get_resolved_issues()
+    # JIRA generation
+    def generate_jira_knowledge(self, full_refresh=False):
+        if full_refresh:
+            print("Starting FULL JIRA knowledge generation...")
+            issues = self.get_all_jira_issues()
+        else:
+            print("Starting incremental JIRA knowledge generation...")
+            issues = self.get_recent_jira_issues()
 
-        created = 0
-        updated = 0
-        unchanged = 0
-        skipped = 0
-        failed = 0
-
-        changed_files = []
+        stats = self._new_stats()
+        stats["fetched"] = len(issues)
 
         for issue in issues:
             try:
                 processed_issue = self._process_issue(issue)
-
                 if processed_issue is None:
-                    skipped += 1
+                    stats["skipped"] += 1
                     continue
 
-                result = self._write_markdown(processed_issue)
-
-                status = result["status"]
-                file_path = result["file"]
-
-                if status == "created":
-                    created += 1
-                    changed_files.append(file_path)
-
-                elif status == "updated":
-                    updated += 1
-                    changed_files.append(file_path)
-
-                elif status == "unchanged":
-                    unchanged += 1
-
-                print(f"{status.capitalize()}: {file_path.name}")
+                result = self._save_jira_issue(processed_issue)
+                self._record(stats, result)
+                print(f"{result['status'].capitalize()}: {result['file'].name}")
 
             except Exception as error:
-                failed += 1
-
+                stats["failed"] += 1
                 print(f"Failed to process {issue.key}: {error}")
 
-        return build_generation_result(
-            fetched=len(issues),
-            created=created,
-            updated=updated,
-            unchanged=unchanged,
-            skipped=skipped,
-            failed=failed,
-            changed_files=changed_files,
-        )
-
-
-class UVARCWebsiteKnowledgeDataManager:
-    SKIP_EXTENSIONS = (
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".gif",
-        ".bmp",
-        ".svg",
-        ".pdf",
-        ".zip",
-        ".tar",
-        ".gz",
-        ".mp4",
-        ".webp",
-    )
-    ALLOWED_NETLOCS = {
-        "rc.virginia.edu",
-        "learning.rc.virginia.edu",
-        "archive.rc.virginia.edu",
-    }
-    SKIP_PATTERNS = ["/author/", "/category/", "/tag/"]
-
-    def __init__(self, output_folder):
-        self.scraper = cloudscraper.create_scraper()
-        self.visited = set()
-        self.documents = {}
-        self.output_folder = Path(output_folder)
-
-        self.local_documents = UVARCLocalKnowledgeDataManager(output_folder)
-
-    def is_valid(self, url):
-        parsed = urlparse(url)
-        path = parsed.path.lower()
-        return (
-            parsed.scheme in {"http", "https"}
-            and parsed.netloc in self.ALLOWED_NETLOCS
-            and not path.endswith(self.SKIP_EXTENSIONS)
-        )
-
-    def crawl(self, url, netloc=None):
-        if url in self.visited:
-            return self.documents
-        self.visited.add(url)
-
-        netloc = netloc or urlparse(url).netloc
-
-        try:
-            response = self.scraper.get(url, timeout=15)
-
-            if response.url != url:
-                url = response.url
-                if url in self.visited:
-                    return self.documents
-                self.visited.add(url)
-
-            content_type = response.headers.get("Content-Type", "")
-            if "text/html" not in content_type:
-                return self.documents
-            if response.status_code != 200:
-                return self.documents
-
-            soup = BeautifulSoup(response.text, "html.parser")
-
-            if len(articles := soup.find_all("article")) != 1:
-                print(f"Skipping {url} (no single article)")
-            else:
-                article_soup = BeautifulSoup(str(articles[0]), "html.parser")
-
-                for tag in article_soup.find_all("img"):
-                    tag.decompose()
-
-                return_link = article_soup.find(
-                    "a", string=re.compile(r"^\u00ab Return to")
-                )
-                if return_link:
-                    return_link.decompose()
-
-                metadata_tag = article_soup.find("p", class_="blog-post-meta")
-
-                for a_tag in article_soup.find_all("a", href=True):
-                    href = a_tag["href"]
-                    if not href.startswith("http"):
-                        href = urljoin(url, href)
-                    a_tag["href"] = href
-                    a_tag.string = f"[{a_tag.get_text(strip=True)}]({href})"
-
-                title_tag = article_soup.find("h2", class_="blog-post-title")
-                if title_tag:
-                    title_text = title_tag.get_text(strip=True)
-                    title_tag.string = f"# {title_text}\n\n"
-
-                for h1_tag in article_soup.find_all("h1"):
-                    h1_text = h1_tag.get_text(strip=True)
-                    h1_tag.string = f"\n\n## {h1_text}\n"
-
-                if metadata_tag:
-                    metadata_tag.decompose()
-
-                text = article_soup.get_text()
-                text = re.sub(r"https?:\/\/\S+?\.png", "", text)
-                text = re.sub(r"\S+\.png", "", text)
-                text = re.sub(r"\n{3,}", "\n\n", text)
-                text = re.sub(r"[ \t]+", " ", text)
-
-                self.documents[url] = {
-                    "text": text.strip(),
-                    "source": url,
-                }
-                print(f"Extracted: {url}")
-
-            for a_tag in soup.find_all("a", href=True):
-                next_url = a_tag["href"]
-                if not next_url.startswith(("http://", "https://")):
-                    next_url = urljoin(url, next_url)
-                next_url = next_url.split("#")[0]
-
-                if next_url not in self.visited and self.is_valid(next_url):
-                    self.crawl(next_url, netloc)
-
-            time.sleep(0.2)
-
-        except Exception as e:
-            print(f"Failed to crawl {url}: {e}")
-
-        return self.documents
-
-    def get_sitemap_urls(self, sitemap_url, skip_patterns=None):
-        skip_patterns = skip_patterns or []
-        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-
-        print(f"Fetching sitemap: {sitemap_url}")
-        resp = self.scraper.get(sitemap_url, timeout=15)
-        resp.raise_for_status()
-
-        print(f"  Status: {resp.status_code}")
-        print(f"  Content-Type: {resp.headers.get('Content-Type')}")
-
-        try:
-            root = ET.fromstring(resp.text)
-        except ET.ParseError as e:
-            print(f"  Could not parse sitemap XML: {e}")
-            print(f"  Response starts with: {resp.text[:300]!r}")
-            return []
-
-        base = "https://" + sitemap_url.split("/")[2]
-        raw = []
-
-        for url in root.findall("sm:url", ns):
-            loc = url.find("sm:loc", ns)
-            if loc is not None and loc.text:
-                raw.append(loc.text.strip())
-
-        urls = [base + u if u.startswith("/") else u for u in raw]
-        urls = [u for u in urls if not any(pattern in u for pattern in skip_patterns)]
-
-        print(f"  Found {len(urls)} URLs")
-        return urls
-
-    def extract_article(self, url):
-        response = self.scraper.get(url, timeout=15)
-        if response.status_code != 200 or "text/html" not in response.headers.get(
-            "Content-Type", ""
-        ):
-            return None
-
-        soup = BeautifulSoup(response.text, "html.parser")
-        articles = soup.find_all("article")
-        if len(articles) != 1:
-            return None
-
-        article_soup = BeautifulSoup(str(articles[0]), "html.parser")
-
-        for tag in article_soup.find_all("img"):
-            tag.decompose()
-
-        metadata_tag = article_soup.find("p", class_="blog-post-meta")
-
-        for a_tag in article_soup.find_all("a", href=True):
-            href = a_tag["href"]
-            if not href.startswith("http"):
-                href = urljoin(url, href)
-            a_tag["href"] = href
-            a_tag.string = "[" + a_tag.get_text(strip=True) + "](" + href + ")"
-
-        if metadata_tag:
-            metadata_tag.decompose()
-
-        text = article_soup.get_text()
-        text = re.sub(r"https?:\/\/\S+?\.png", "", text)
-        text = re.sub(r"\S+\.png", "", text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        text = re.sub(r"[ \t]+", " ", text)
-
-        return {"text": text.strip(), "source": url}
-
-    def fill_sitemap_gaps(self):
-        rc_urls = self.get_sitemap_urls("https://rc.virginia.edu/sitemap.xml")
-        learn_urls = self.get_sitemap_urls(
-            "https://learning.rc.virginia.edu/sitemap.xml", self.SKIP_PATTERNS
-        )
-        all_sitemap_urls = rc_urls + learn_urls
-
-        missing = [u for u in all_sitemap_urls if u not in self.documents]
-        print(
-            f"Sitemap total: {len(all_sitemap_urls)}, already crawled: {len(all_sitemap_urls) - len(missing)}, missing: {len(missing)}"
-        )
-
-        for url in missing:
-            try:
-                result = self.extract_article(url)
-                if result:
-                    self.documents[url] = result
-                    print(f"Added: {url}")
-                else:
-                    print(f"Skipped (no article): {url}")
-                time.sleep(0.2)
-            except Exception as e:
-                print(f"Failed {url}: {e}")
-
-        print(f"\nTotal documents after gap fill: {len(self.documents)}")
-
-    def patch_js_rendered_pages(self):
-        manual_patches = {
-            "https://rc.virginia.edu/userinfo/hpc/slurm-script-generator/": {
-                "text": "# Slurm Script Generator\n\nThe UVA Research Computing Slurm Script Generator...",
-                "source": "https://rc.virginia.edu/userinfo/hpc/slurm-script-generator/",
-            },
-            "https://rc.virginia.edu/userinfo/hpc/software/physics/": {
-                "text": "# Physics Software on UVA HPC\n\nUVA Research Computing provides several physics...",
-                "source": "https://rc.virginia.edu/userinfo/hpc/software/physics/",
-            },
-        }
-
-        patched = 0
-        for url, doc in manual_patches.items():
-            if (
-                url not in self.documents
-                or len(self.documents.get(url, {}).get("text", "")) < 100
-            ):
-                self.documents[url] = doc
-                patched += 1
-                print(f"Patched: {url}")
-            else:
-                print(f"Already has content: {url}")
-
-        print(f"\nManually patched {patched} JS-rendered pages.")
-        print(f"Total documents: {len(self.documents)}")
-
-    @staticmethod
-    def safe_filename(url):
-        filename = re.sub(r"[^a-zA-Z0-9_\-]", "_", url)
-        filename = re.sub(r"_+", "_", filename).strip("_")
-        return filename[:150]
-
-    def generate_markdown_files(self):
-        print(f"Documents available: {len(self.documents)}")
-
-        print(f"Writing files to: {self.output_folder}")
-
-        created = 0
-        updated = 0
-        unchanged = 0
-        skipped = 0
-        failed = 0
-
-        changed_files = []
-
-        for url, doc in self.documents.items():
-            try:
-                filename = f"{self.safe_filename(url)}.md"
-
-                result = self.local_documents.save_document(
-                    filename,
-                    doc["text"],
-                )
-
-                status = result["status"]
-                file_path = result["file"]
-
-                if status == "created":
-                    created += 1
-                    changed_files.append(file_path)
-
-                elif status == "updated":
-                    updated += 1
-                    changed_files.append(file_path)
-
-                elif status == "unchanged":
-                    unchanged += 1
-
-                print(f"{status.capitalize()}: {file_path.name}")
-
-            except Exception as e:
-                failed += 1
-
-                print(f"ERROR processing {url}: {e}")
-
-        return build_generation_result(
-            fetched=len(self.documents),
-            created=created,
-            updated=updated,
-            unchanged=unchanged,
-            skipped=skipped,
-            failed=failed,
-            changed_files=changed_files,
-        )
-
-    def generate_knowledge_documents(self):
-        print("Starting knowledge file generation...")
-
-        self.crawl("https://rc.virginia.edu/")
-
-        self.crawl("https://learning.rc.virginia.edu/")
-
-        self.fill_sitemap_gaps()
-        self.patch_js_rendered_pages()
-
-        return self.generate_markdown_files()
-
-
-class UVARCVideoKnowledgeDataManager:
-    PLAYLIST_URL = (
-        "https://www.youtube.com/playlist?list=PLT4bryHgBcRP7N-hB9u6EWs6tq_2nMoRO"
-    )
-
-    def __init__(self, output_folder):
-        self.output_folder = Path(output_folder)
-
-        self.local_documents = UVARCLocalKnowledgeDataManager(output_folder)
-
-    def _fetch_playlist(self):
-        ydl_options = {
-            "extract_flat": True,
-            "quiet": True,
-        }
-
-        with YoutubeDL(ydl_options) as ydl:
-            info = ydl.extract_info(
-                self.PLAYLIST_URL,
-                download=False,
-            )
-
-        entries = info.get("entries", [])
-
-        print(f"Found {len(entries)} videos in: {info.get('title', 'Unknown')}")
-
-        return entries
-
-    def _get_video_metadata(self, video_url):
-
-        ydl_options = {
-            "quiet": True,
-            "skip_download": True,
-        }
-
-        with YoutubeDL(ydl_options) as ydl:
-            info = ydl.extract_info(
-                video_url,
-                download=False,
-            )
-
-        return {
-            "title": info.get("title", ""),
-            "author": info.get("uploader", ""),
-            "description": info.get(
-                "description",
-                "",
-            ),
-            "length": info.get("duration", 0),
-            "publish_date": info.get(
-                "upload_date",
-                "",
-            ),
-            "webpage_url": info.get(
-                "webpage_url",
-                video_url,
-            ),
-        }
-
-    def _get_transcript(self, video_id):
-
-        api = YouTubeTranscriptApi()
-
-        transcript = api.fetch(
-            video_id,
-            languages=["en"],
-        )
-
-        return " ".join(
-            entry.text.strip() for entry in transcript if entry.text.strip()
-        )
-
-    def _process_video(self, entry):
-
-        video_url = entry["url"]
-
-        video_id = entry.get(
-            "id",
-            video_url.split("v=")[-1],
-        )
-
-        metadata = self._get_video_metadata(video_url)
-
-        transcript = self._get_transcript(video_id)
-
-        return {
-            "id": video_id,
-            "metadata": metadata,
-            "transcript": transcript,
-        }
-
-    def _safe_filename(self, filename):
-
-        filename = re.sub(
-            r'[<>:"/\\|?*]',
-            "_",
-            filename,
-        )
-
-        filename = re.sub(
-            r"\s+",
-            " ",
-            filename,
-        ).strip()
-
-        return filename[:150]
-
-    def _build_markdown(self, video):
-
-        metadata = video["metadata"]
-        transcript = video["transcript"]
-
-        markdown = f"""# {metadata["title"]}
-
-            ## Video Information
-
-            **Source:** YouTube
-            **Author:** {metadata["author"]}
-            **URL:** {metadata["webpage_url"]}
-            **Publish Date:** {metadata["publish_date"]}
-
-            ---
-
-            ## Description
-
-            {metadata["description"]}
-
-            ---
-
-            ## Transcript
-
-            {transcript}
-            """
-
-        return markdown.strip() + "\n"
-
-    def _write_markdown(self, video):
-
-        filename = f"youtube_{video['id']}.md"
-
-        markdown = self._build_markdown(video)
-
-        return self.local_documents.save_document(
-            filename,
-            markdown,
-        )
-
-    def generate_knowledge_documents(self):
-
-        entries = self._fetch_playlist()
-
-        created = 0
-        updated = 0
-        unchanged = 0
-        skipped = 0
-        failed = 0
-
-        changed_files = []
-
-        for entry in entries:
-            try:
-                print(f"Loading: {entry.get('title', 'Unknown')}")
-
-                video = self._process_video(entry)
-
-                result = self._write_markdown(video)
-
-                status = result["status"]
-                file_path = result["file"]
-
-                if status == "created":
-                    created += 1
-                    changed_files.append(file_path)
-
-                elif status == "updated":
-                    updated += 1
-                    changed_files.append(file_path)
-
-                elif status == "unchanged":
-                    unchanged += 1
-
-                print(f"{status.capitalize()}: {file_path.name}")
-
-            except Exception as error:
-                failed += 1
-
-                print(f"Failed to process {entry.get('title', 'Unknown')}: {error}")
-
-        return build_generation_result(
-            fetched=len(entries),
-            created=created,
-            updated=updated,
-            unchanged=unchanged,
-            skipped=skipped,
-            failed=failed,
-            changed_files=changed_files,
-        )
-
-
-class UVARCMarkdownKnowledgeDataManager:
-    GITHUB_REPO = "uvarc/rc-learning"
-    GITHUB_BRANCH = "main"
-    CONTENT_PATH = "content"
-
-    def __init__(self, output_folder):
-        self.output_folder = Path(output_folder)
-
-        self.local_documents = UVARCLocalKnowledgeDataManager(output_folder)
-
-    def _fetch_repository_tree(self):
-        tree_url = (
-            f"https://api.github.com/repos/"
-            f"{self.GITHUB_REPO}/git/trees/"
-            f"{self.GITHUB_BRANCH}?recursive=1"
-        )
-
-        response = requests.get(
-            tree_url,
-            timeout=30,
-        )
-
-        response.raise_for_status()
-
-        return response.json().get("tree", [])
-
-    def _get_markdown_files(self, tree):
-        return [
-            item
-            for item in tree
-            if item["type"] == "blob"
-            and item["path"].startswith(self.CONTENT_PATH + "/")
-            and item["path"].endswith(".md")
-        ]
-
-    def _fetch_markdown_file(self, path):
-        raw_url = (
-            f"https://raw.githubusercontent.com/"
-            f"{self.GITHUB_REPO}/"
-            f"{self.GITHUB_BRANCH}/"
-            f"{path}"
-        )
-
-        response = requests.get(
-            raw_url,
-            timeout=15,
-        )
-
-        response.raise_for_status()
-
-        return response.text
-
-    def _is_draft(self, text):
-        # TOML frontmatter
-        if text.startswith("+++"):
-            end = text.find("+++", 3)
-
-            if end != -1:
-                frontmatter = text[3:end]
-
-                if "draft = true" in frontmatter:
-                    return True
-
-        # YAML frontmatter
-        if text.startswith("---"):
-            end = text.find("---", 3)
-
-            if end != -1:
-                frontmatter = text[3:end]
-
-                if "draft: true" in frontmatter:
-                    return True
-
-        return False
-
-    def _safe_filename(self, filename):
-        filename = re.sub(
-            r'[<>:"\\|?*]',
-            "_",
-            filename,
-        )
-
-        filename = re.sub(
-            r"\s+",
-            " ",
-            filename,
-        ).strip()
-
-        return filename[:150]
-
-    def _build_filename(self, source):
-        relative_path = source.split(
-            f"{self.CONTENT_PATH}/",
-            1,
-        )[-1]
-
-        flat_name = self._safe_filename(
-            relative_path.removesuffix(".md").replace("/", "_")
-        )
-
-        return f"{flat_name}.md"
-
-    def _write_markdown(self, document):
-        filename = self._build_filename(document["source"])
-
-        return self.local_documents.save_document(
-            filename,
-            document["content"],
-        )
-
-    def generate_knowledge_documents(self):
-        tree = self._fetch_repository_tree()
-
-        markdown_files = self._get_markdown_files(tree)
-
-        print(
-            f"Found {len(markdown_files)} "
-            f"Markdown files in "
-            f"{self.GITHUB_REPO}/{self.CONTENT_PATH}"
-        )
-
-        documents = []
-
-        created = 0
-        updated = 0
-        unchanged = 0
-        skipped = 0
-        failed = 0
-
-        changed_files = []
-
-        for item in markdown_files:
-            path = item["path"]
-
-            try:
-                text = self._fetch_markdown_file(path)
-
-                if self._is_draft(text):
-                    print(f"Skipping draft: {path}")
-
-                    skipped += 1
-                    continue
-
-                documents.append(
-                    {
-                        "source": path,
-                        "content": text,
-                    }
-                )
-
-            except Exception as error:
-                failed += 1
-
-                print(f"Failed to fetch {path}: {error}")
-
-        # Deduplicate identical content
-        unique_documents = {document["content"]: document for document in documents}
-
-        duplicate_count = len(documents) - len(unique_documents)
-
-        skipped += duplicate_count
-
-        documents = list(unique_documents.values())
-
-        print(f"Loaded {len(documents)} documents after deduplication")
-
-        for document in documents:
-            try:
-                result = self._write_markdown(document)
-
-                status = result["status"]
-                file_path = result["file"]
-
-                if status == "created":
-                    created += 1
-                    changed_files.append(file_path)
-
-                elif status == "updated":
-                    updated += 1
-                    changed_files.append(file_path)
-
-                elif status == "unchanged":
-                    unchanged += 1
-
-                print(f"{status.capitalize()}: {file_path.name}")
-
-            except Exception as error:
-                failed += 1
-
-                print(f"Failed to write {document['source']}: {error}")
-
-        return build_generation_result(
-            fetched=len(markdown_files),
-            created=created,
-            updated=updated,
-            unchanged=unchanged,
-            skipped=skipped,
-            failed=failed,
-            changed_files=changed_files,
-        )
-
-
-# Open WebUI Knowledge Base
-
-
-class UVARCKnowledgeBaseManager:
-    def __init__(self):
-        self.open_webui_url = os.getenv("OPENWEBUI_URL")
-
-        self.api_key = os.getenv("OPENWEBUI_API_KEY")
-
-        self.knowledge_base_id = os.getenv("OPENWEBUI_KB_ID")
-
-        self.headers = {"Authorization": (f"Bearer {self.api_key}")}
-
-    def upload_file(self, file_path):
-
-        file_path = Path(file_path)
-
-        print(f"Uploading: {file_path.name}")
-
-        try:
-            with open(file_path, "rb") as file:
-                response = requests.post(
-                    (f"{self.open_webui_url}/api/v1/files/"),
-                    headers=self.headers,
-                    files={
-                        "file": (
-                            file_path.name,
-                            file,
-                            "text/plain",
-                        )
-                    },
-                    data={"metadata": "{}"},
-                )
-
-            if response.status_code not in (
-                200,
-                201,
-            ):
-                print(f"  ERROR uploading file (HTTP {response.status_code})")
-
-                print(f"  {response.text}")
-
-                return None
-
-            result = response.json()
-
-            file_id = result.get("id")
-
-            print("  Uploaded successfully.")
-
-            print(f"  File ID: {file_id}")
-
-            return file_id
-
-        except Exception as error:
-            print(f"  ERROR: {error}")
-
-            return None
-
-    def add_file_to_knowledge_base(
-        self,
-        file_id,
-        file_name,
-    ):
-
-        print(f"  Adding {file_name} to Knowledge Base...")
-
-        try:
-            response = requests.post(
-                (
-                    f"{self.open_webui_url}"
-                    "/api/v1/knowledge/"
-                    f"{self.knowledge_base_id}"
-                    "/file/add"
-                ),
-                headers={
-                    **self.headers,
-                    "Content-Type": "application/json",
-                },
-                json={"file_id": file_id},
-            )
-
-            if response.status_code not in (
-                200,
-                201,
-            ):
-                print(f"  ERROR adding to Knowledge Base (HTTP {response.status_code})")
-
-                print(f"  {response.text}")
-
-                return False
-
-            print("  Added to Knowledge Base successfully.")
-
-            return True
-
-        except Exception as error:
-            print(f"  ERROR: {error}")
-
-            return False
+        return self.build_generation_result(**stats)

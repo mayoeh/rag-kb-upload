@@ -1,60 +1,21 @@
 import argparse
-
-from app.kb_integration.tasks import (
-    update_all_sources,
-    update_jira_knowledge,
-    update_website_knowledge,
-    update_video_knowledge,
-    update_markdown_knowledge,
-    update_knowledge_base,
-)
-
+from app.kb_integration.business import RCKBKnowledgeManager
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="RC Knowledge Base Integration"
-    )
-
-    parser.add_argument(
-        "task",
-        choices=[
-            "jira",
-            "website",
-            "video",
-            "markdown",
-            "scrape",
-            "upload",
-        ],
-        help=(
-            "jira = update JIRA knowledge, "
-            "website = update website knowledge, "
-            "video = update Youtube knowledge, "
-            "markdown = update tutorial knowledge, "
-            "scrape = update all knowledge sources, "
-            "upload = upload existing files to Open WebUI"
-        ),
-    )
-
+    parser = argparse.ArgumentParser(description="Build RC knowledge base files")
+    parser.add_argument("--website", action="store_true", help="Crawl the RC websites")
+    parser.add_argument("--jira", action="store_true", help="Pull recent JIRA tickets")
+    parser.add_argument("--full", action="store_true", help="With --jira: pull all tickets, not just the last 2 days")
     args = parser.parse_args()
 
-    if args.task == "jira":
-        update_jira_knowledge()
+    # No flags = run everything
+    run_all = not (args.website or args.jira)
 
-    elif args.task == "website":
-        update_website_knowledge()
+    if args.website or run_all:
+        RCKBKnowledgeManager(output_folder="data/website").generate_website_knowledge()
 
-    elif args.task == "video":
-        update_video_knowledge()
-
-    elif args.task == "markdown":
-        update_markdown_knowledge()
-
-    elif args.task == "scrape":
-        update_all_sources()
-
-    elif args.task == "upload":
-        update_knowledge_base()
-
+    if args.jira or run_all:
+        RCKBKnowledgeManager(output_folder="data/jira").generate_jira_knowledge(full_refresh=args.full)
 
 if __name__ == "__main__":
     main()

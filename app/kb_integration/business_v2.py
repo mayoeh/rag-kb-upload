@@ -142,7 +142,7 @@ class RCKBKnowledgeManager:
                     next_url = urljoin(url, next_url)
                 next_url = next_url.split("#")[0]
 
-                if next_url not in visited and self.is_valid(next_url):
+                if next_url not in visited and self._is_valid(next_url):
                     self._crawl(scraper, next_url, visited, netloc)
 
             time.sleep(0.2)

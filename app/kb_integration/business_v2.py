@@ -36,7 +36,7 @@ class RCKBKnowledgeManager:
         scraper = cloudscraper.create_scraper()
         visited = set()
         self._crawl(scraper, "https://rc.virginia.edu/", visited)
-        self.crawl(scraper, "https://learning.rc.virginia.edu/", visited)
+        self._crawl(scraper, "https://learning.rc.virginia.edu/", visited)
         self.fill_sitemap_gaps()
         self.patch_js_rendered_pages()
 

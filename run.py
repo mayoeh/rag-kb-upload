@@ -8,6 +8,7 @@ def main():
     parser.add_argument("--website", action="store_true", help="Crawl the RC websites")
     parser.add_argument("--jira", action="store_true", help="Pull recent JIRA tickets")
     parser.add_argument("--full", action="store_true", help="With --jira: pull all tickets, not just the last 2 days")
+    parser.add_argument("--video", action="store_true", help="Pull the RC YouTube playlist")
     parser.add_argument("--wiki", action="store_true", help="Scrape the RCI wiki (needs NetBadge cookies)")
     parser.add_argument("--wiki-login", action="store_true", help="Log in through NetBadge + Duo and save the wiki cookies")
     parser.add_argument("--max-pages", type=int, default=None, help="With --wiki: stop after this many pages (for quick tests)")
@@ -19,13 +20,16 @@ def main():
         return
 
     # No flags = run everything
-    run_all = not (args.website or args.jira or args.wiki)
+    run_all = not (args.website or args.jira or args.video or args.wiki)
 
     if args.website or run_all:
         RCKBKnowledgeManager(output_folder="data/website").generate_website_knowledge()
 
     if args.jira or run_all:
         RCKBKnowledgeManager(output_folder="data/jira").generate_jira_knowledge(full_refresh=args.full)
+
+    if args.video or run_all:
+        RCKBKnowledgeManager(output_folder="data/video").generate_video_knowledge()
 
     if args.wiki or run_all:
         RCKBKnowledgeManager(output_folder="data/wiki").generate_wiki_knowledge(max_pages=args.max_pages)

@@ -309,7 +309,7 @@ class RCKBKnowledgeManager:
         }
 
     # Given the title of a source, transform it to a usable, safe filename
-    def generate_sanitized_filename(self, name, maxLength, hasSpaces):
+    def generate_sanitized_filename(self, name, maxLength=200, hasSpaces=False):
         if not name:
             return ""
 

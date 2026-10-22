@@ -1,12 +1,14 @@
+import json
 import os
 import re
 import time
 import xml.etree.ElementTree as ET
 from html import unescape
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import cloudscraper
+import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from jira import JIRA
@@ -14,6 +16,15 @@ from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
 
 load_dotenv()
+
+
+class WikiAuthenticationError(RuntimeError):
+    """Raised when the saved NetBadge cookies are missing or expired.
+
+    Refreshing them needs a Duo push approved on a phone, so this can never
+    be recovered from automatically. Callers should surface it as an alert
+    rather than retry.
+    """
 
 
 class RCKBKnowledgeManager:
@@ -62,6 +73,40 @@ class RCKBKnowledgeManager:
         "AND type != Sub-task "
         'AND "Request Type[Dropdown]" != "Provisioning/Deprovisioning" '
         "AND status != Open "
+    )
+
+    # RCI wiki (Gitit behind NetBadge)
+    WIKI_BASE_URL = "https://rci.hpc.virginia.edu/wiki/"
+    WIKI_INDEX_URL = "https://rci.hpc.virginia.edu/wiki/_index"
+    WIKI_LOGIN_TARGET = "https://rci.hpc.virginia.edu/wiki/Special:AllPages"
+    WIKI_REQUEST_DELAY = 0.3  # seconds between page requests
+    # Gitit special paths and old wiki sections we never want indexed
+    WIKI_SKIP_PATH_SEGMENTS = (
+        "/_edit/",
+        "/_history/",
+        "/_discuss/",
+        "/_delete/",
+        "/_login",
+        "/_logout",
+        "/_index",
+        "/_categories",
+        "/_random",
+        "/_search",
+        "/_upload",
+        "/_activity",
+        "/_export",
+        "/OldWiki",
+        "/OldOldWiki",
+    )
+    # Tags that end a line. Everything else (<code>, <a>, <strong>, ...) stays
+    # inline, or sentences get chopped up around every command name.
+    WIKI_BLOCK_TAGS = (
+        "p", "div", "br", "hr",
+        "h1", "h2", "h3", "h4", "h5", "h6",
+        "li", "ul", "ol", "dl", "dt", "dd",
+        "pre", "blockquote",
+        "table", "tr", "thead", "tbody",
+        "section", "article", "header", "footer",
     )
 
     def __init__(self, output_folder):
@@ -674,3 +719,564 @@ class RCKBKnowledgeManager:
                 print(f"Failed to process {issue.key}: {error}")
 
         return self.build_generation_result(**stats)
+
+    ############################
+    #        WIKI LOGIC        #
+    ############################
+
+    @staticmethod
+    def wiki_default_cookies_path():
+        project_root = Path(__file__).resolve().parents[2]
+        return project_root / "scrapers" / "auth_cookies.json"
+
+    def _make_wiki_session(self, cookies_path=None):
+        # Load the NetBadge cookies saved by netbadge_login()
+        cookies_path = Path(
+            cookies_path
+            or os.getenv("WIKI_AUTH_COOKIES_PATH")
+            or self.wiki_default_cookies_path()
+        )
+        if not cookies_path.exists():
+            raise WikiAuthenticationError(
+                f"{cookies_path} not found. Run netbadge_login() to create it."
+            )
+
+        session = requests.Session()
+        for cookie in json.loads(cookies_path.read_text(encoding="utf-8")):
+            session.cookies.set(
+                cookie["name"],
+                cookie["value"],
+                domain=cookie.get("domain", "").lstrip("."),
+                path=cookie.get("path", "/"),
+            )
+        session.headers.update(
+            {"User-Agent": "Mozilla/5.0 (compatible; UVA-RC-RAG-Scraper/1.0)"}
+        )
+        return session
+
+    def _check_wiki_session(self, response):
+        # A NetBadge page returned with HTTP 200 means the cookies died
+        # mid-run. Fail loudly instead of saving login pages as documents.
+        if "NetBadge" in response.text or "shibidp" in response.url:
+            raise WikiAuthenticationError(
+                "NetBadge redirect — cookies expired. Re-run netbadge_login()."
+            )
+
+    def _should_skip_wiki_url(self, url):
+        parsed = urlparse(url)
+
+        # "?printable" and "?revision=" map to the same filename as the plain
+        # page and would overwrite it
+        if parsed.query:
+            return True
+
+        if parsed.path.lower().endswith(self.SKIP_EXTENSIONS):
+            return True
+
+        return any(segment in parsed.path for segment in self.WIKI_SKIP_PATH_SEGMENTS)
+
+    def _wiki_page_title(self, url):
+        path = urlparse(url).path
+        if path.startswith("/wiki/"):
+            return unquote(path[len("/wiki/"):])
+        return url
+
+    def _get_wiki_page_urls(self, session):
+        # _index only lists the top level. Subdirectories show up as
+        # <li class="folder"> links (e.g. /wiki/Guides/) whose own listing has
+        # to be expanded in turn. The front page is not listed anywhere.
+        urls = [self.WIKI_BASE_URL]
+        folders = [self.WIKI_INDEX_URL]
+        seen_folders = set(folders)
+
+        while folders:
+            folder_url = folders.pop(0)
+            response = session.get(folder_url, timeout=20)
+            self._check_wiki_session(response)
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            entries = soup.select("li.page, li.folder")
+            if not entries:
+                print(f"Could not find page listing on {folder_url}")
+                continue
+
+            for entry in entries:
+                a_tag = entry.find("a", href=True)
+                if not a_tag:
+                    continue
+
+                url = urljoin(folder_url, a_tag["href"]).split("#")[0]
+                if "/wiki/" not in url or self._should_skip_wiki_url(url):
+                    continue
+
+                if "folder" in entry.get("class", []):
+                    if url not in seen_folders:
+                        seen_folders.add(url)
+                        folders.append(url)
+                else:
+                    urls.append(url)
+
+            time.sleep(self.WIKI_REQUEST_DELAY)
+
+        print(f"Expanded {len(seen_folders) - 1} folders")
+        return list(dict.fromkeys(urls))
+
+    def _get_wiki_soup(self, session, url):
+        response = session.get(url, timeout=20)
+        if response.status_code != 200:
+            return None
+
+        self._check_wiki_session(response)
+
+        if "text/html" not in response.headers.get("Content-Type", ""):
+            return None
+        return BeautifulSoup(response.text, "html.parser")
+
+    def _fetch_wiki_page(self, session, url):
+        # Returns (url, soup). Gitit's listing drops a leading space from page
+        # names, so "HPC Support/ SLURM" is listed as ".../SLURM" and 404s.
+        # Retry with the space put back.
+        soup = self._get_wiki_soup(session, url)
+        if soup is not None:
+            return url, soup
+
+        head, _, name = url.rpartition("/")
+        spaced_url = f"{head}/%20{name}"
+        soup = self._get_wiki_soup(session, spaced_url)
+        if soup is not None:
+            return spaced_url, soup
+
+        return url, None
+
+    def _scrub_wiki_text(self, text):
+        # Wiki pages are full of module names (gcc9, cuda11) that UVA_ID_RE
+        # matches, and Presidio reads command and host names as PERSON, so
+        # only emails and phone numbers are scrubbed here
+        if not text:
+            return text
+
+        results = self.analyzer.analyze(
+            text=text,
+            language="en",
+            entities=["EMAIL_ADDRESS", "PHONE_NUMBER"],
+        )
+        return self.anonymizer.anonymize(text=text, analyzer_results=results).text
+
+    def _wiki_soup_to_text(self, node):
+        # get_text(separator="\n") would put every inline tag on its own line,
+        # so mark the block boundaries first and then join with nothing
+        for tag in node.find_all(self.WIKI_BLOCK_TAGS):
+            tag.insert_before("\n")
+            tag.insert_after("\n")
+
+        # Keep table cells apart on the same line
+        for tag in node.find_all(["td", "th"]):
+            tag.insert_after(" ")
+
+        return node.get_text()
+
+    def _parse_wiki_page(self, url, soup, scrub_pii=True):
+        # Returns {"title", "text", "source", "tags"} for one Gitit page, or None
+        wikipage = soup.find(id="wikipage")
+        if not wikipage:
+            return None
+
+        for element in wikipage.select("#TOC, .editsection, .footnotes"):
+            element.decompose()
+
+        for tag in wikipage.find_all("img"):
+            tag.decompose()
+
+        # Take the title from the <h1> and drop it; _build_wiki_markdown adds
+        # the heading back
+        title_tag = wikipage.find("h1")
+        title = title_tag.get_text(strip=True) if title_tag else self._wiki_page_title(url)
+        if title_tag:
+            title_tag.decompose()
+
+        for a_tag in wikipage.find_all("a", href=True):
+            href = urljoin(url, a_tag["href"])
+            a_tag["href"] = href
+            link_text = a_tag.get_text(strip=True)
+            if link_text:
+                a_tag.string = f"[{link_text}]({href})"
+
+        text = self._wiki_soup_to_text(wikipage)
+
+        # clean_markdown_text only drops .png references
+        text = re.sub(r"\S+\.(?:jpg|jpeg|gif|svg|webp)", "", text)
+        text = self.clean_markdown_text(text).strip()
+        if not text:
+            return None
+
+        category_div = soup.find(id="categories") or soup.find(class_="categories")
+        categories = (
+            [a_tag.get_text(strip=True) for a_tag in category_div.find_all("a")]
+            if category_div
+            else []
+        )
+
+        if scrub_pii:
+            title = self._scrub_wiki_text(title)
+            text = self._scrub_wiki_text(text)
+
+        return {
+            "title": title,
+            "text": text,
+            "source": url,
+            "tags": ["wiki"] + categories,
+        }
+
+    def _build_wiki_markdown(self, page):
+        title = page["title"] or "Wiki Page"
+        text = page["text"]
+        body = text if text.startswith("#") else f"# {title}\n\n{text}"
+
+        return f"""{body}
+
+---
+
+## Wiki Page
+
+**Source:** {page["source"]}
+
+**Tags:** {", ".join(page["tags"])}
+"""
+
+    def _wiki_filename(self, url):
+        # Named from the URL path, not the title: two pages can share an <h1>.
+        # Each segment is stripped so "HPC Support/ SLURM" does not become a
+        # double underscore.
+        title = "/".join(part.strip() for part in self._wiki_page_title(url).split("/"))
+        slug = re.sub(r"\s+", "_", title)
+        slug = self.generate_sanitized_filename(slug, 150, True).strip("_")
+        return f"wiki_{slug or 'index'}.md"
+
+    # Wiki generation
+    def generate_wiki_knowledge(self, cookies_path=None, max_pages=None, scrub_pii=True):
+        # Needs valid NetBadge cookies. They cannot be refreshed unattended
+        # (Duo push), so WikiAuthenticationError aborts the run instead of
+        # being counted as a failed page.
+        print("Starting wiki knowledge generation...")
+        session = self._make_wiki_session(cookies_path)
+
+        response = session.get(self.WIKI_BASE_URL, timeout=20)
+        self._check_wiki_session(response)
+
+        page_urls = self._get_wiki_page_urls(session)
+        print(f"Found {len(page_urls)} wiki pages")
+        if max_pages:
+            page_urls = page_urls[:max_pages]
+
+        stats = self._new_stats()
+
+        for index, url in enumerate(page_urls, 1):
+            print(f"  [{index}/{len(page_urls)}] {self._wiki_page_title(url)}")
+            try:
+                url, soup = self._fetch_wiki_page(session, url)
+                if soup is None:
+                    print("    Skipped (page not found)")
+                    stats["skipped"] += 1
+                    continue
+
+                stats["fetched"] += 1
+                page = self._parse_wiki_page(url, soup, scrub_pii)
+                if page is None:
+                    print("    Skipped (no content)")
+                    stats["skipped"] += 1
+                    continue
+
+                result = self.save_document(
+                    self._wiki_filename(url), self._build_wiki_markdown(page)
+                )
+                self._record(stats, result)
+                print(f"    {result['status'].capitalize()}: {result['file'].name}")
+
+            except WikiAuthenticationError:
+                raise
+
+            except Exception as error:
+                stats["failed"] += 1
+                print(f"    Failed: {error}")
+
+            time.sleep(self.WIKI_REQUEST_DELAY)
+
+        return self.build_generation_result(**stats)
+
+
+############################
+#   WIKI NETBADGE LOGIN    #
+############################
+
+
+def netbadge_login(
+    username,
+    password,
+    target=None,
+    output=None,
+    timeout=120,
+    debug_dir=None,
+):
+    """Log in through NetBadge + Duo and save the session cookies to `output`.
+
+    Runs a headless Chromium via Playwright's *sync* API, so it must not be
+    called from inside a running asyncio event loop (that is why the notebook
+    used the async API). Intended to be driven by an interactive script,
+    where a human is present to approve the Duo push.
+
+    When `debug_dir` is given, the Duo page and any timeout are captured as
+    screenshots there. Duo can block headless browsers outright, and the
+    screenshot is usually the only way to see why.
+    """
+
+    from playwright.sync_api import sync_playwright
+
+    target = target or RCKBKnowledgeManager.WIKI_LOGIN_TARGET
+    output = Path(output or RCKBKnowledgeManager.wiki_default_cookies_path())
+
+    username_selector = (
+        "input[name='j_username'], "
+        "input[name='username'], "
+        "input[id='username']"
+    )
+
+    password_selector = (
+        "input[name='j_password'], "
+        "input[name='password'], "
+        "input[id='password']"
+    )
+
+    if debug_dir:
+        debug_dir = Path(debug_dir)
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_debug(page, name):
+        if not debug_dir:
+            return
+
+        try:
+            path = debug_dir / f"{name}.png"
+            page.screenshot(path=str(path))
+            print(f"  Screenshot saved -> {path}")
+        except Exception as error:
+            print(f"  [warn] Could not capture {name}: {error}")
+
+    # Duo Verified Push shows a 3-digit code in the browser that has to be
+    # typed into Duo Mobile. Headless means nobody can see it, so pull it out
+    # of the page and print it. The code renders a moment after the push is
+    # triggered, so this gets called repeatedly until it turns up.
+    seen_codes = set()
+    seen_snippets = set()
+
+    def report_duo_code(page):
+
+        try:
+            body_text = page.locator("body").inner_text()
+        except Exception:
+            return
+
+        codes = re.findall(
+            r"(?<!\d)(\d{3})(?!\d)",
+            body_text,
+        )
+
+        for code in codes:
+            if code in seen_codes:
+                continue
+
+            seen_codes.add(code)
+
+            print()
+            print("  " + "=" * 44)
+            print(
+                f"  DUO CODE: {code}   "
+                "<- enter this in Duo Mobile"
+            )
+            print("  " + "=" * 44)
+            print(flush=True)
+
+        if not codes and not seen_codes:
+            # No 3-digit code found. Show the page text instead, so a
+            # 2-digit code, a device picker or a bot block is still visible.
+            # Only on change, or it repeats on every poll.
+            snippet = " | ".join(
+                line.strip()
+                for line in body_text.splitlines()
+                if line.strip()
+            )[:400]
+
+            if snippet and snippet not in seen_snippets:
+                seen_snippets.add(snippet)
+                print(f"  Duo page: {snippet}", flush=True)
+
+    print("Launching headless browser ...", flush=True)
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+
+        try:
+            page.goto(target, timeout=30000)
+            page.wait_for_load_state(
+                "domcontentloaded",
+                timeout=20000,
+            )
+            page.wait_for_timeout(2000)
+
+            # Step 1: the certificate-auth failure page, if it appears
+
+            for _ in range(4):
+                if page.locator("#mw-content-text").count() > 0:
+                    break
+
+                if (
+                    "my.policy" in page.url
+                    or "Certificate Login Failed" in page.content()
+                ):
+                    print(
+                        "  Certificate auth failed page "
+                        "— clicking Continue ..."
+                    )
+
+                    page.locator(
+                        "a:has-text('Continue'), "
+                        "input[value='Continue'], "
+                        "button:has-text('Continue')"
+                    ).first.click()
+
+                    page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=20000,
+                    )
+                    page.wait_for_timeout(2000)
+
+                    print(f"  Now at: {page.url}")
+
+                if page.locator(username_selector).count() > 0:
+                    page.locator(username_selector).first.fill(username)
+                    page.locator(password_selector).first.fill(password)
+
+                    # Enter submits the password form only. Clicking the
+                    # visible button can hit the separate certificate-login
+                    # form instead.
+                    page.locator(password_selector).first.press("Enter")
+
+                    page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=30000,
+                    )
+                    page.wait_for_timeout(2000)
+
+                    print(f"  URL after submit: {page.url}")
+                    break
+
+            # Step 2: Duo two-factor
+
+            if page.locator("#mw-content-text").count() == 0:
+                page.wait_for_timeout(3000)
+
+                for push_text in [
+                    "Send Me a Push",
+                    "Send push",
+                    "Push",
+                    "Send request",
+                ]:
+                    push_button = page.locator(
+                        f"button:has-text('{push_text}'), "
+                        f"input[value='{push_text}'], "
+                        f"a:has-text('{push_text}')"
+                    )
+
+                    if push_button.count() > 0:
+                        print(f"  Clicking Duo button: '{push_text}'")
+                        push_button.first.click()
+                        page.wait_for_timeout(1500)
+                        break
+
+                save_debug(page, "debug_duo")
+
+                # Give the prompt a moment to render the code, then read it.
+                page.wait_for_timeout(2000)
+                report_duo_code(page)
+
+                print()
+                print(
+                    "Waiting for you to approve the Duo push "
+                    "on your phone ...",
+                    flush=True,
+                )
+
+            # Step 3: wait for the wiki itself
+
+            deadline = time.time() + timeout
+
+            while time.time() < deadline:
+                current_url = page.url
+
+                if (
+                    "rci.hpc.virginia.edu/wiki/" in current_url
+                    and "shibidp" not in current_url
+                    and "duosecurity" not in current_url
+                ):
+                    break
+
+                print(
+                    f"  [{int(deadline - time.time())}s left] "
+                    f"URL: {current_url}",
+                    flush=True,
+                )
+
+                if "duosecurity" in current_url:
+                    report_duo_code(page)
+
+                for button_text in [
+                    "Trust this browser",
+                    "Stay signed in",
+                    "Yes",
+                    "Continue",
+                    "Proceed",
+                ]:
+                    button = page.locator(
+                        f"button:has-text('{button_text}'), "
+                        f"input[value='{button_text}']"
+                    )
+
+                    if button.count() > 0:
+                        print(
+                            "  Clicking intermediate button: "
+                            f"'{button_text}'"
+                        )
+                        button.first.click()
+                        page.wait_for_load_state(
+                            "domcontentloaded",
+                            timeout=15000,
+                        )
+                        break
+
+                page.wait_for_timeout(5000)
+            else:
+                save_debug(page, "debug_final")
+
+                raise WikiAuthenticationError(
+                    "NetBadge/Duo login timed out. "
+                    f"Final URL: {page.url}"
+                )
+
+            print("Login successful!")
+
+            cookies = context.cookies()
+
+            output.parent.mkdir(parents=True, exist_ok=True)
+
+            output.write_text(
+                json.dumps(cookies, indent=2),
+                encoding="utf-8",
+            )
+
+            print(f"Saved {len(cookies)} cookies -> {output}")
+
+            return output
+
+        finally:
+            browser.close()

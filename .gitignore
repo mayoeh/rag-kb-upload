@@ -9,3 +9,10 @@ data/**/*
 
 !data/**/
 !data/**/.gitkeep
+
+# local backups, old drafts and debug output (wiki backups contain internal content)
+.backup/
+app/kb_integration/old_files/
+scrapers/debug/
+scrapers/debug_*.png
+scripts/

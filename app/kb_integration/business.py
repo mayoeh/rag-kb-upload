@@ -287,12 +287,11 @@ class UVARCJiraKnowledgeDataManager:
                     or ""
                 )
 
-            if not rendered_body:
-                if isinstance(
-                    raw_comment.body,
-                    str,
-                ):
-                    rendered_body = raw_comment.body
+            if not rendered_body and isinstance(
+                raw_comment.body,
+                str,
+            ):
+                rendered_body = raw_comment.body
 
             body = self._html_to_text(rendered_body)
 

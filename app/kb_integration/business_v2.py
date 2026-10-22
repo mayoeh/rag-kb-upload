@@ -42,7 +42,7 @@ class RCKBKnowledgeManager:
 
     # Helper Functions
 
-    def _is_valid(url):
+    def _is_valid(self, url):
         SKIP_EXTENSIONS = (
             ".png",
             ".jpg",

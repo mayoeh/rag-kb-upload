@@ -895,7 +895,9 @@ class RCKBKnowledgeManager:
             title_tag.decompose()
 
         for a_tag in wikipage.find_all("a", href=True):
-            href = urljoin(url, a_tag["href"])
+            href = a_tag["href"]
+            if not href.startswith("http"):
+                href = urljoin(url, href)
             a_tag["href"] = href
             link_text = a_tag.get_text(strip=True)
             if link_text:

@@ -28,7 +28,7 @@ class RCKBKnowledgeManager:
         )
 
     ############################
-    #    MAIN SCRAPER LOGIC    #
+    # MAIN WEBSITE SCRAPER LOGIC#
     ############################
 
     # Most general website scraper
@@ -276,6 +276,136 @@ class RCKBKnowledgeManager:
                 print(f"Already has content: {url}")
 
         print(f"\nManually patched {patched} JS-rendered pages.")
+
+    ############################
+    # MAIN VIDEO SCRAPER LOGIC #
+    ############################
+
+    def _generate_website_knowledge(self):
+        videos = self._fetch_playlist()
+        for video in videos:
+            self._process_video(video)
+            self._write_markdown(video)
+
+    def _fetch_playlist(self):
+        PLAYLIST_URL = (
+            "https://www.youtube.com/playlist?list=PLT4bryHgBcRP7N-hB9u6EWs6tq_2nMoRO"
+        )
+        ydl_options = {
+            "extract_flat": True,
+            "quiet": True,
+        }
+        with YoutubeDL(ydl_options) as ydl:
+            info = ydl.extract_info(
+                PLAYLIST_URL,
+                download=False,
+            )
+
+        entries = info.get("entries", [])
+
+        print(f"Found {len(entries)} videos in: {info.get('title', 'Unknown')}")
+
+        return entries
+
+    def _get_video_metadata(self, video_url):
+
+        ydl_options = {
+            "quiet": True,
+            "skip_download": True,
+        }
+
+        with YoutubeDL(ydl_options) as ydl:
+            info = ydl.extract_info(
+                video_url,
+                download=False,
+            )
+
+        return {
+            "title": info.get("title", ""),
+            "author": info.get("uploader", ""),
+            "description": info.get(
+                "description",
+                "",
+            ),
+            "length": info.get("duration", 0),
+            "publish_date": info.get(
+                "upload_date",
+                "",
+            ),
+            "webpage_url": info.get(
+                "webpage_url",
+                video_url,
+            ),
+        }
+
+    def _get_transcript(self, video_id):
+
+        api = YouTubeTranscriptApi()
+
+        transcript = api.fetch(
+            video_id,
+            languages=["en"],
+        )
+
+        return " ".join(
+            entry.text.strip() for entry in transcript if entry.text.strip()
+        )
+
+    def _process_video(self, entry):
+
+        video_url = entry["url"]
+
+        video_id = entry.get(
+            "id",
+            video_url.split("v=")[-1],
+        )
+
+        metadata = self._get_video_metadata(video_url)
+
+        transcript = self._get_transcript(video_id)
+
+        return {
+            "id": video_id,
+            "metadata": metadata,
+            "transcript": transcript,
+        }
+
+    def _build_markdown(self, video):
+
+        metadata = video["metadata"]
+        transcript = video["transcript"]
+
+        markdown = f"""# {metadata["title"]}
+
+            ## Video Information
+
+            **Source:** YouTube
+            **Author:** {metadata["author"]}
+            **URL:** {metadata["webpage_url"]}
+            **Publish Date:** {metadata["publish_date"]}
+
+            ---
+
+            ## Description
+
+            {metadata["description"]}
+
+            ---
+
+            ## Transcript
+
+            {transcript}
+            """
+
+        return markdown.strip() + "\n"
+
+    def _write_markdown(self, video):
+
+        filename = f"youtube_{video['id']}.md"
+
+        markdown = self._build_markdown(video)
+
+        self.save_document(filename, markdown)
 
     ############################
     #     UTILITY METHODS      #

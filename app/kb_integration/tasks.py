@@ -4,9 +4,15 @@ import time
 from .business import (
     UVARCJiraKnowledgeDataManager,
     UVARCVideoKnowledgeDataManager,
-    UVARCWebsiteKnowledgeDataManager,
     UVARCMarkdownKnowledgeDataManager,
     UVARCKnowledgeBaseManager,
+)
+
+# Website and wiki run on the v2 single-class refactor. Jira, video and
+# markdown stay on business.py until they are ported.
+from .business_v2 import (
+    RCKBKnowledgeManager,
+    WikiAuthenticationError,
 )
 
 
@@ -43,14 +49,51 @@ def update_website_knowledge():
 
     website_folder = KNOWLEDGE_FOLDER / "website"
 
-    manager = UVARCWebsiteKnowledgeDataManager(
+    manager = RCKBKnowledgeManager(
         output_folder=website_folder
     )
 
-    manager.generate_knowledge_documents()
+    result = manager._generate_website_knowledge()
 
     print()
     print("Website Update Complete")
+
+    return result
+
+def update_wiki_knowledge(max_pages=None):
+    # Scrape the RCI wiki and generate Markdown knowledge documents.
+    #
+    # Requires valid NetBadge cookies on disk. They cannot be refreshed
+    # unattended, because NetBadge needs a Duo push approved on a phone,
+    # so run refresh_wiki_auth() first.
+
+    print("Updating RCI Wiki Knowledge")
+
+    wiki_folder = KNOWLEDGE_FOLDER / "wiki"
+
+    manager = RCKBKnowledgeManager(
+        output_folder=wiki_folder
+    )
+
+    result = manager._generate_wiki_knowledge(max_pages=max_pages)
+
+    print()
+    print("Wiki Update Complete")
+
+    return result
+
+def refresh_wiki_auth():
+    # Interactive NetBadge login. Prompts for credentials and waits for a
+    # Duo push, so this is never safe to call from a scheduled job.
+
+    import getpass
+
+    from .business_v2 import netbadge_login
+
+    username = input("UVA Computing ID : ")
+    password = getpass.getpass("Password         : ")
+
+    return netbadge_login(username, password)
 
 def update_video_knowledge():
     print("Updating Video Knowledge")
@@ -68,21 +111,21 @@ def update_video_knowledge():
 
     return result
 
-def update_markdown_knowledge():
-    print("Updating Markdown Knowledge")
+# def update_markdown_knowledge():
+#     print("Updating Markdown Knowledge")
 
-    markdown_folder = KNOWLEDGE_FOLDER / "markdown"
+#     markdown_folder = KNOWLEDGE_FOLDER / "markdown"
 
-    manager = UVARCMarkdownKnowledgeDataManager(
-        output_folder=markdown_folder
-    )
+#     manager = UVARCMarkdownKnowledgeDataManager(
+#         output_folder=markdown_folder
+#     )
 
-    result = manager.generate_knowledge_documents()
+#     result = manager.generate_knowledge_documents()
 
-    print()
-    print("Markdown Update Complete")
+#     print()
+#     print("Markdown Update Complete")
 
-    return result
+#     return result
 
 def update_all_sources():
     # Regenerate local knowledge documents for every source.
@@ -93,8 +136,15 @@ def update_all_sources():
 
     results["jira"] = update_jira_knowledge()
     results["website"] = update_website_knowledge()
+
+    # Expired wiki cookies must not take the other sources down with them.
+    try:
+        results["wiki"] = update_wiki_knowledge()
+    except WikiAuthenticationError as error:
+        print(f"SKIPPING wiki: {error}")
+        results["wiki"] = {"error": str(error)}
+
     results["video"] = update_video_knowledge()
-    results["markdown"] = update_markdown_knowledge()
 
     print()
     print("Knowledge Source Update Complete")

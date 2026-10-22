@@ -377,7 +377,7 @@ class RCKBKnowledgeManager:
         self,
         cookies_path=None,
         max_pages=None,
-        crawl_links=True,
+        crawl_links=False,
         scrub_pii=True,
         scrub_uva_ids=False,
     ):
@@ -500,27 +500,48 @@ class RCKBKnowledgeManager:
         )
 
     def _get_wiki_page_urls(self, session):
-        # Every content page listed on /wiki/_index
-        response = session.get(self.WIKI_INDEX_URL, timeout=20)
-        self._check_wiki_session(response)
+        # Every content page in the wiki. The _index only lists the top
+        # level: subdirectories show up as <li class="folder"> links
+        # (e.g. /wiki/Guides/) whose own listing has to be expanded in turn.
+        # The front page is not listed anywhere, so it is added by hand.
+        urls = [self.WIKI_BASE_URL]
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        content = soup.find(id="wikipage") or soup.find(id="content")
+        folders = [self.WIKI_INDEX_URL]
+        seen_folders = set(folders)
 
-        if not content:
-            print("[ERROR] Could not find page listing on _index")
-            return []
+        while folders:
+            folder_url = folders.pop(0)
 
-        urls = []
+            response = session.get(folder_url, timeout=20)
+            self._check_wiki_session(response)
 
-        for a_tag in content.find_all("a", href=True):
-            if a_tag.get_text(strip=True) == "(delete)":
+            soup = BeautifulSoup(response.text, "html.parser")
+            entries = soup.select("li.page, li.folder")
+
+            if not entries:
+                print(f"[ERROR] Could not find page listing on {folder_url}")
                 continue
 
-            full_url = urljoin(self.WIKI_BASE_URL, a_tag["href"]).split("#")[0]
+            for entry in entries:
+                a_tag = entry.find("a", href=True)
+                if not a_tag:
+                    continue
 
-            if not self._should_skip_wiki_url(full_url) and "/wiki/" in full_url:
-                urls.append(full_url)
+                full_url = urljoin(folder_url, a_tag["href"]).split("#")[0]
+
+                if "/wiki/" not in full_url or self._should_skip_wiki_url(full_url):
+                    continue
+
+                if "folder" in entry.get("class", []):
+                    if full_url not in seen_folders:
+                        seen_folders.add(full_url)
+                        folders.append(full_url)
+                else:
+                    urls.append(full_url)
+
+            time.sleep(self.WIKI_REQUEST_DELAY)
+
+        print(f"Expanded {len(seen_folders) - 1} folders")
 
         # Deduplicate while preserving discovery order
         return list(dict.fromkeys(urls))
@@ -632,7 +653,10 @@ class RCKBKnowledgeManager:
     # Name files from the URL path, not the title — two wiki pages can
     # share an <h1> and would otherwise overwrite each other.
     def _wiki_filename(self, url):
-        slug = re.sub(r"\s+", "_", self._wiki_page_title(url))
+        # Strip each path segment so "HPC Support/ SLURM" (leading space in
+        # the page name) does not turn into a double underscore
+        title = "/".join(part.strip() for part in self._wiki_page_title(url).split("/"))
+        slug = re.sub(r"\s+", "_", title)
         slug = self.generate_sanitized_filename(slug, 150, True).strip("_")
 
         # The wiki root has nothing after /wiki/
@@ -669,8 +693,19 @@ class RCKBKnowledgeManager:
             try:
                 soup = self._get_wiki_soup(session, url)
 
+                # Gitit's listing drops a leading space from page names, so a
+                # page saved as "HPC Support/ SLURM" is listed as
+                # ".../SLURM" and 404s. Retry with the space put back.
+                if soup is None:
+                    head, _, name = url.rpartition("/")
+                    spaced_url = f"{head}/%20{name}"
+                    soup = self._get_wiki_soup(session, spaced_url)
+                    if soup is not None:
+                        url = spaced_url
+
                 if soup is None:
                     results[url] = {"status": "skipped"}
+                    print("    (skipped — page not found)")
                 else:
                     self._save_wiki_page(url, soup, results, scrub)
 

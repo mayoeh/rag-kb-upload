@@ -135,7 +135,7 @@ Final website step. For each entry in `JS_RENDERED_PATCHES` whose file was **not
 | `WIKI_BLOCK_TAGS` | HTML tags that end a line when converting to text (everything else stays inline) |
 | `WIKI_SAVED_STATUSES` | `("created", "updated", "unchanged")` — statuses that mean a page was written |
 
-#### `_generate_wiki_knowledge(self, cookies_path=None, max_pages=None, crawl_links=True, scrub_pii=True, scrub_uva_ids=False)`
+#### `_generate_wiki_knowledge(self, cookies_path=None, max_pages=None, crawl_links=False, scrub_pii=True, scrub_uva_ids=False)`
 
 **Entry point for the wiki scraper.** Requires cookies created by `netbadge_login()`.
 
@@ -144,8 +144,8 @@ Final website step. For each entry in `JS_RENDERED_PATCHES` whose file was **not
    - `scrub_pii=True` (default) removes **email addresses and phone numbers** with presidio.
    - `PERSON` detection is intentionally off — presidio reads module, command and host names as people's names.
    - `scrub_uva_ids` is off by default because the computing-ID pattern matches module names such as `gcc9` or `cuda11`.
-3. **Phase 1** — `_wiki_extract_index_pages()`: scrape every page listed on `_index`.
-4. **Phase 2** (if `crawl_links`) — `_wiki_crawl_links()`: breadth-first crawl from the wiki root to find pages missing from `_index`.
+3. **Phase 1** — `_wiki_extract_index_pages()`: scrape every page listed on `_index`, including the pages inside its folders.
+4. **Phase 2** (only if `crawl_links=True`, off by default) — `_wiki_crawl_links()`: breadth-first crawl from the wiki root to find pages missing from `_index`. Since Phase 1 expands the folders it finds nothing extra (checked 2026-10-22: Phase 1 alone saved 239 pages, a superset of the old two-phase run), so it is only kept as an occasional cross-check.
 5. Returns the summary dict from `_summarize_results()`.
 
 `max_pages` limits both phases (useful for testing).
@@ -184,7 +184,7 @@ Counts entries in `results` whose status is in `WIKI_SAVED_STATUSES`. Used for p
 
 #### `_get_wiki_page_urls(self, session)`
 
-Fetches `_index` and returns every content-page URL it lists, in discovery order and de-duplicated. Skips the "(delete)" links, strips fragments, and filters with `_should_skip_wiki_url()`. Returns `[]` if the page listing cannot be found.
+Returns every content-page URL in the wiki, in discovery order and de-duplicated. `_index` only lists the top level: subdirectories appear as `<li class="folder">` links (e.g. `/wiki/Guides/`), so each folder's own listing is fetched and expanded in turn. Only `li.page` / `li.folder` entries are read, which also leaves out the "(delete)" links. Fragments are stripped and URLs filtered with `_should_skip_wiki_url()` (which drops `OldWiki`/`OldOldWiki`). The front page is not listed anywhere, so `WIKI_BASE_URL` is added first.
 
 #### `_get_wiki_soup(self, session, url)`
 
@@ -213,7 +213,7 @@ Renders a page dict as the final Markdown document: a `# title` heading (unless 
 
 #### `_wiki_filename(self, url)`
 
-Builds the filename `wiki_<slug>.md` from the URL path (spaces → `_`, then `generate_sanitized_filename(..., 150, True)`). The wiki root becomes `wiki_index.md`. Files are named from the **path, not the title**, because two pages can share the same `<h1>` and would otherwise overwrite each other.
+Builds the filename `wiki_<slug>.md` from the URL path (each path segment stripped, spaces → `_`, then `generate_sanitized_filename(..., 150, True)`). The wiki root becomes `wiki_index.md`. Files are named from the **path, not the title**, because two pages can share the same `<h1>` and would otherwise overwrite each other.
 
 #### `_save_wiki_page(self, url, soup, results, scrub)`
 
@@ -221,7 +221,7 @@ Parses the page with `_parse_wiki_page()`. If it yields nothing, records `skippe
 
 #### `_wiki_extract_index_pages(self, session, results, scrub, max_pages=None)`
 
-**Phase 1.** Gets all URLs from `_get_wiki_page_urls()` (trimmed to `max_pages` if set) and, for each one, fetches it and calls `_save_wiki_page()`. Pages that cannot be fetched are `skipped`, other exceptions are `failed`, and `WikiAuthenticationError` is re-raised to abort the run. Waits `WIKI_REQUEST_DELAY` between pages.
+**Phase 1.** Gets all URLs from `_get_wiki_page_urls()` (trimmed to `max_pages` if set) and, for each one, fetches it and calls `_save_wiki_page()`. If a listed page 404s it is retried with a leading space (`%20`) in its name, since the listing drops leading spaces ("HPC Support/ SLURM" is listed as `.../SLURM`). Pages that still cannot be fetched are `skipped`, other exceptions are `failed`, and `WikiAuthenticationError` is re-raised to abort the run. Waits `WIKI_REQUEST_DELAY` between pages.
 
 #### `_wiki_crawl_links(self, session, results, scrub, max_pages=None)`
 

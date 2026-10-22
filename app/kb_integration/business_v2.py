@@ -85,7 +85,7 @@ class RCKBKnowledgeManager:
     # RCI wiki (Gitit behind NetBadge)
     WIKI_BASE_URL = "https://rci.hpc.virginia.edu/wiki/"
     WIKI_INDEX_URL = "https://rci.hpc.virginia.edu/wiki/_index"
-    WIKI_LOGIN_TARGET = "https://rci.hpc.virginia.edu/wiki/Special:AllPages"
+    WIKI_LOGIN_TARGET = "https://rci.hpc.virginia.edu/wiki/"
     WIKI_REQUEST_DELAY = 0.3  # seconds between page requests
     # Gitit special paths and old wiki sections we never want indexed
     WIKI_SKIP_PATH_SEGMENTS = (
@@ -1084,6 +1084,7 @@ class RCKBKnowledgeManager:
             page_urls = page_urls[:max_pages]
 
         stats = self._new_stats()
+        stats["fetched"] = len(page_urls)
 
         for index, url in enumerate(page_urls, 1):
             print(f"  [{index}/{len(page_urls)}] {self._wiki_page_title(url)}")
@@ -1094,7 +1095,6 @@ class RCKBKnowledgeManager:
                     stats["skipped"] += 1
                     continue
 
-                stats["fetched"] += 1
                 page = self._parse_wiki_page(url, soup, scrub_pii)
                 if page is None:
                     print("    Skipped (no content)")
@@ -1242,7 +1242,7 @@ def netbadge_login(
             # Step 1: the certificate-auth failure page, if it appears
 
             for _ in range(4):
-                if page.locator("#mw-content-text").count() > 0:
+                if page.locator("#wikipage").count() > 0:
                     break
 
                 if (
@@ -1284,11 +1284,18 @@ def netbadge_login(
                     page.wait_for_timeout(2000)
 
                     print(f"  URL after submit: {page.url}")
+
+                    # A rejected password re-renders the NetBadge form, so
+                    # without this the Duo wait below would just time out
+                    if "Incorrect computing ID or password" in page.content():
+                        raise WikiAuthenticationError(
+                            "Incorrect computing ID or password."
+                        )
                     break
 
             # Step 2: Duo two-factor
 
-            if page.locator("#mw-content-text").count() == 0:
+            if page.locator("#wikipage").count() == 0:
                 page.wait_for_timeout(3000)
 
                 for push_text in [

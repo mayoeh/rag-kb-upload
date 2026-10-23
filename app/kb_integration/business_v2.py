@@ -14,7 +14,11 @@ from dotenv import load_dotenv
 from jira import JIRA
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
-from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api import (
+    NoTranscriptFound,
+    TranscriptsDisabled,
+    YouTubeTranscriptApi,
+)
 from yt_dlp import YoutubeDL
 
 load_dotenv()
@@ -81,6 +85,7 @@ class RCKBKnowledgeManager:
     VIDEO_PLAYLIST_URL = (
         "https://www.youtube.com/playlist?list=PLT4bryHgBcRP7N-hB9u6EWs6tq_2nMoRO"
     )
+    VIDEO_REQUEST_DELAY = 1.0  # seconds between videos; the transcript API rate-limits
 
     # RCI wiki (Gitit behind NetBadge)
     WIKI_BASE_URL = "https://rci.hpc.virginia.edu/wiki/"
@@ -761,7 +766,15 @@ class RCKBKnowledgeManager:
         }
 
     def _get_transcript(self, video_id):
-        transcript = YouTubeTranscriptApi().fetch(video_id, languages=["en"])
+        # A video without English captions is still worth keeping for its
+        # title and description. Rate limits (IpBlocked/RequestBlocked) are
+        # not caught here, so they still count as failures.
+        try:
+            transcript = YouTubeTranscriptApi().fetch(video_id, languages=["en"])
+        except (NoTranscriptFound, TranscriptsDisabled):
+            print(f"  No English transcript for {video_id}")
+            return "No transcript available."
+
         return " ".join(
             entry.text.strip() for entry in transcript if entry.text.strip()
         )
@@ -830,6 +843,8 @@ class RCKBKnowledgeManager:
             except Exception as error:
                 stats["failed"] += 1
                 print(f"Failed to process {entry.get('title', 'Unknown')}: {error}")
+
+            time.sleep(self.VIDEO_REQUEST_DELAY)
 
         return self.build_generation_result(**stats)
 
@@ -1087,7 +1102,7 @@ class RCKBKnowledgeManager:
         stats["fetched"] = len(page_urls)
 
         for index, url in enumerate(page_urls, 1):
-            print(f"  [{index}/{len(page_urls)}] {self._wiki_page_title(url)}")
+            print(f"  [{index}/{len(page_urls)}] {self._wiki_page_title(url) or '(front page)'}")
             try:
                 url, soup = self._fetch_wiki_page(session, url)
                 if soup is None:

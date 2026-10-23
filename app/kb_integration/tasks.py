@@ -1,12 +1,9 @@
 from pathlib import Path
 import time
 
-from .business import (
-    UVARCJiraKnowledgeDataManager,
-    UVARCVideoKnowledgeDataManager,
-    UVARCWebsiteKnowledgeDataManager,
-    UVARCMarkdownKnowledgeDataManager,
-    UVARCKnowledgeBaseManager,
+from .business_v2 import (
+    RCKBKnowledgeManager,
+    WikiAuthenticationError,
 )
 
 
@@ -20,69 +17,47 @@ RETRY_DELAY = 2
 
 # Source Updates
 
-def update_jira_knowledge():
+def update_jira_knowledge(full_refresh=False):
     # Scrape JIRA and generate Markdown knowledge documents
 
     print("Updating JIRA Knowledge")
 
-    jira_folder = KNOWLEDGE_FOLDER / "jira"
-
-    manager = UVARCJiraKnowledgeDataManager(
-        output_folder=jira_folder
+    manager = RCKBKnowledgeManager(
+        output_folder=KNOWLEDGE_FOLDER / "jira"
     )
 
-    result = manager.generate_knowledge_documents()
-
-    print()
-
-    return result
+    return manager.generate_jira_knowledge(full_refresh=full_refresh)
 
 def update_website_knowledge():
-
     print("Updating RC Website(s) Knowledge")
 
-    website_folder = KNOWLEDGE_FOLDER / "website"
-
-    manager = UVARCWebsiteKnowledgeDataManager(
-        output_folder=website_folder
+    manager = RCKBKnowledgeManager(
+        output_folder=KNOWLEDGE_FOLDER / "website"
     )
 
-    manager.generate_knowledge_documents()
-
-    print()
-    print("Website Update Complete")
+    return manager.generate_website_knowledge()
 
 def update_video_knowledge():
     print("Updating Video Knowledge")
 
-    video_folder = KNOWLEDGE_FOLDER / "video"
-
-    manager = UVARCVideoKnowledgeDataManager(
-        output_folder=video_folder
+    manager = RCKBKnowledgeManager(
+        output_folder=KNOWLEDGE_FOLDER / "video"
     )
 
-    result = manager.generate_knowledge_documents()
+    return manager.generate_video_knowledge()
 
-    print()
-    print("Video Update Complete")
+def update_wiki_knowledge(max_pages=None):
+    # Needs NetBadge cookies from `python run.py --wiki-login`. They cannot
+    # be refreshed unattended (Duo push), so expired cookies raise
+    # WikiAuthenticationError.
 
-    return result
+    print("Updating RCI Wiki Knowledge")
 
-def update_markdown_knowledge():
-    print("Updating Markdown Knowledge")
-
-    markdown_folder = KNOWLEDGE_FOLDER / "markdown"
-
-    manager = UVARCMarkdownKnowledgeDataManager(
-        output_folder=markdown_folder
+    manager = RCKBKnowledgeManager(
+        output_folder=KNOWLEDGE_FOLDER / "wiki"
     )
 
-    result = manager.generate_knowledge_documents()
-
-    print()
-    print("Markdown Update Complete")
-
-    return result
+    return manager.generate_wiki_knowledge(max_pages=max_pages)
 
 def update_all_sources():
     # Regenerate local knowledge documents for every source.
@@ -94,7 +69,13 @@ def update_all_sources():
     results["jira"] = update_jira_knowledge()
     results["website"] = update_website_knowledge()
     results["video"] = update_video_knowledge()
-    results["markdown"] = update_markdown_knowledge()
+
+    # Expired wiki cookies must not take the other sources down with them
+    try:
+        results["wiki"] = update_wiki_knowledge()
+    except WikiAuthenticationError as error:
+        print(f"Skipping wiki: {error}")
+        results["wiki"] = {"error": str(error)}
 
     print()
     print("Knowledge Source Update Complete")
@@ -142,66 +123,11 @@ def add_file_with_retry(
 
 
 def update_knowledge_base():
-    # Upload existing local knowledge documents to Open WebUI
-    # Does not access scrapers
+    # Upload local knowledge documents to Open WebUI.
+    # UVARCKnowledgeBaseManager was removed with the old business.py and has
+    # not been ported to business_v2 yet. add_file_with_retry() above is kept
+    # for that port.
 
-    print("Updating Open WebUI Knowledge Base")
-
-    print(f"Folder: {KNOWLEDGE_FOLDER}")
-    print()
-
-    if not KNOWLEDGE_FOLDER.exists():
-        print(
-            "ERROR: Knowledge folder does not exist."
-        )
-        return
-
-    files = [
-        file
-        for file in KNOWLEDGE_FOLDER.rglob("*")
-        if (
-            file.is_file()
-            and file.suffix.lower()
-            in ALLOWED_EXTENSIONS
-        )
-    ]
-
-    print(f"Found {len(files)} files.")
-    print()
-
-    if not files:
-        print(
-            "No .md or .txt files found."
-        )
-        return
-
-    manager = UVARCKnowledgeBaseManager()
-
-    successful = 0
-    failed = 0
-
-    for file_path in files:
-        file_id = manager.upload_file(
-            file_path
-        )
-
-        if file_id:
-            if add_file_with_retry(
-                manager,
-                file_id,
-                file_path.name,
-            ):
-                successful += 1
-            else:
-                failed += 1
-
-        else:
-            failed += 1
-
-        print()
-
-    print("Upload Complete")
-
-    print(f"Total files: {len(files)}")
-    print(f"Successful:  {successful}")
-    print(f"Failed:      {failed}")
+    raise NotImplementedError(
+        "Open WebUI upload is being ported to business_v2"
+    )

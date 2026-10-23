@@ -104,7 +104,7 @@ The RCI wiki is behind NetBadge, which requires a Duo approval on a phone, so th
 python run.py --wiki-login
 ```
 
-This asks for your computing ID and password, prints a 3-digit Duo code to enter in Duo Mobile, and saves the cookies to `scrapers/auth_cookies.json` (git-ignored; set `WIKI_AUTH_COOKIES_PATH` to use another location). It replaces the older `scrapers/save_auth.py`.
+This asks for your computing ID and password, prints a 3-digit Duo code to enter in Duo Mobile, and saves the cookies to `scrapers/auth_cookies.json` (git-ignored; set `WIKI_AUTH_COOKIES_PATH` to use another location).
 
 The cookies have been seen to expire in under 7.5 hours. When they do, the wiki is skipped with a message and the other sources still run; log in again and rerun `python run.py --wiki`.
 

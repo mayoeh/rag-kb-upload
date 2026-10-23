@@ -183,6 +183,22 @@ class RCKBKnowledgeManager:
         if status in ("created", "updated"):
             stats["changed_files"].append(result["file"])
 
+    def _find_stale_files(self, prefix, expected_filenames):
+        # Documents left over from earlier runs whose source no longer exists
+        # (page deleted, video removed from the playlist). Only listed, never
+        # deleted: a source that is briefly unreachable would otherwise wipe
+        # its documents.
+        stale = sorted(
+            path
+            for path in self.output_folder.glob(f"{prefix}*.md")
+            if path.name not in expected_filenames
+        )
+        if stale:
+            print(f"Stale files (source no longer lists them): {len(stale)}")
+            for path in stale:
+                print(f"  {path.name}")
+        return stale
+
     def build_generation_result(
         self,
         fetched,
@@ -779,9 +795,17 @@ class RCKBKnowledgeManager:
             entry.text.strip() for entry in transcript if entry.text.strip()
         )
 
+    @staticmethod
+    def _video_id(entry):
+        # Works for playlist entries and for _process_video() results
+        return entry.get("id") or entry["url"].split("v=")[-1]
+
+    def _video_filename(self, entry):
+        return f"youtube_{self._video_id(entry)}.md"
+
     def _process_video(self, entry):
         video_url = entry["url"]
-        video_id = entry.get("id", video_url.split("v=")[-1])
+        video_id = self._video_id(entry)
 
         return {
             "id": video_id,
@@ -819,7 +843,7 @@ class RCKBKnowledgeManager:
 
     def _save_video(self, video):
         return self.save_document(
-            f"youtube_{video['id']}.md",
+            self._video_filename(video),
             self._build_video_markdown(video),
         )
 
@@ -827,6 +851,7 @@ class RCKBKnowledgeManager:
     def generate_video_knowledge(self, max_videos=None):
         print("Starting video knowledge generation...")
         entries = self._fetch_playlist()
+        all_entries = entries
         if max_videos:
             entries = entries[:max_videos]
 
@@ -846,7 +871,15 @@ class RCKBKnowledgeManager:
 
             time.sleep(self.VIDEO_REQUEST_DELAY)
 
-        return self.build_generation_result(**stats)
+        result = self.build_generation_result(**stats)
+
+        # A partial run (max_videos) would flag every unvisited video
+        if not max_videos:
+            result["stale_files"] = self._find_stale_files(
+                "youtube_",
+                {self._video_filename(entry) for entry in all_entries},
+            )
+        return result
 
     ############################
     #        WIKI LOGIC        #
@@ -1095,6 +1128,8 @@ class RCKBKnowledgeManager:
 
         page_urls = self._get_wiki_page_urls(session)
         print(f"Found {len(page_urls)} wiki pages")
+        # Leading-space pages map to the same filename as their listed URL
+        expected_filenames = {self._wiki_filename(url) for url in page_urls}
         if max_pages:
             page_urls = page_urls[:max_pages]
 
@@ -1131,7 +1166,12 @@ class RCKBKnowledgeManager:
 
             time.sleep(self.WIKI_REQUEST_DELAY)
 
-        return self.build_generation_result(**stats)
+        result = self.build_generation_result(**stats)
+
+        # A partial run (max_pages) would flag every unvisited page
+        if not max_pages:
+            result["stale_files"] = self._find_stale_files("wiki_", expected_filenames)
+        return result
 
 
 ############################

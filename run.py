@@ -1,7 +1,11 @@
 import argparse
 import getpass
 
-from app.kb_integration.business_v2 import RCKBKnowledgeManager, netbadge_login
+from app.kb_integration.business_v2 import (
+    RCKBKnowledgeManager,
+    WikiAuthenticationError,
+    netbadge_login,
+)
 
 def main():
     parser = argparse.ArgumentParser(description="Build RC knowledge base files")
@@ -32,7 +36,15 @@ def main():
         RCKBKnowledgeManager(output_folder="data/video").generate_video_knowledge()
 
     if args.wiki or run_all:
-        RCKBKnowledgeManager(output_folder="data/wiki").generate_wiki_knowledge(max_pages=args.max_pages)
+        # Expired cookies need a person to approve Duo, so report it instead of
+        # crashing. Exit non-zero when the wiki was asked for explicitly.
+        try:
+            RCKBKnowledgeManager(output_folder="data/wiki").generate_wiki_knowledge(max_pages=args.max_pages)
+        except WikiAuthenticationError as error:
+            print(f"Wiki skipped: {error}")
+            print("Refresh the cookies with: python run.py --wiki-login")
+            if args.wiki:
+                raise SystemExit(1)
 
 if __name__ == "__main__":
     main()

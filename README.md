@@ -2,29 +2,20 @@
 
 ## Knowledge Base Integration
 
-This project retrieves content from UVA Research Computing knowledge sources, converts the content into Markdown, stores it locally under `data/`, and provides a separate process for uploading generated documents to Open WebUI.
+This project retrieves content from UVA Research Computing knowledge sources, converts it into Markdown, and stores it locally under `data/`. A separate step uploads the generated documents to an Open WebUI knowledge base for the UVA GenAI RAG used by the RC support team.
 
-Production scraper logic is located in:
+All scraper logic lives in one class, `RCKBKnowledgeManager`, in `app/kb_integration/business_v2.py`. See [`business_v2.md`](app/kb_integration/business_v2.md) for a function-by-function reference.
 
-```text
-app/kb_integration/
-├── business.py
-└── tasks.py
-```
-
-The notebooks under `scrapers/` are retained for development and reference, but are not used by the production workflow.
+The notebooks under `scrapers/` are kept for development and reference and are not used by the workflow.
 
 ## Knowledge Sources
 
-Generated knowledge documents are stored under the repository's `data/` directory:
-
-| Source | Manager | Output folder |
-| --- | --- | --- |
-| JIRA | `UVARCJiraKnowledgeDataManager` | `data/jira/` |
-| RC Learning / Markdown | `UVARCMarkdownKnowledgeDataManager` | `data/markdown/` |
-| Website | `UVARCWebsiteKnowledgeDataManager` | `data/website/` |
-| Wiki | `UVARCWikiKnowledgeDataManager` | `data/wiki/` |
-| Video / YouTube | `UVARCVideoKnowledgeDataManager` | `data/video/` |
+| Source | Entry point (`RCKBKnowledgeManager`) | Output folder | File naming |
+| --- | --- | --- | --- |
+| JIRA (SUP, RIV, IVY, ACCORDSUP) | `generate_jira_knowledge(full_refresh=False)` | `data/jira/` | `jira_SUP-1234.md` |
+| RC websites | `generate_website_knowledge()` | `data/website/` | sanitized URL, e.g. `https_rc_virginia_edu_userinfo_hpc.md` |
+| YouTube (RC Tutorial Series) | `generate_video_knowledge()` | `data/video/` | `youtube_<video id>.md` |
+| RCI wiki (behind NetBadge) | `generate_wiki_knowledge()` | `data/wiki/` | `wiki_<page path>.md`, e.g. `wiki_Guides_HPC_Support_SLURM.md` |
 
 ## Project Structure
 
@@ -32,65 +23,43 @@ Generated knowledge documents are stored under the repository's `data/` director
 rag-kb-upload/
 ├── app/
 │   └── kb_integration/
-│       ├── __init__.py
-│       ├── business.py
-│       └── tasks.py
-├── data/
-│   ├── jira/
-│   ├── markdown/
-│   ├── video/
-│   ├── website/
-│   └── wiki/
-├── scrapers/
-├── .env
+│       ├── business_v2.py    # RCKBKnowledgeManager: all scrapers + netbadge_login()
+│       ├── business_v2.md    # function reference
+│       └── tasks.py          # update_* task wrappers (for Celery)
+├── config/
+├── data/                     # generated documents (not committed)
+├── scrapers/                 # development notebooks
 ├── .env.example
-├── requirements.txt
-└── run.py
-```
-
-### `business.py`
-
-Contains the source-specific knowledge managers and Open WebUI integration.
-
-```text
-UVARCLocalKnowledgeDataManager
-UVARCJiraKnowledgeDataManager
-UVARCMarkdownKnowledgeDataManager
-UVARCVideoKnowledgeDataManager
-UVARCWebsiteKnowledgeDataManager
-UVARCWikiKnowledgeDataManager
-UVARCKnowledgeBaseManager
+├── requirements
+└── run.py                    # command-line entry point
 ```
 
 ### `tasks.py`
 
-Contains the tasks used to run individual source updates, all source updates, and Open WebUI uploads.
+Thin wrappers that pick the output folder and call the matching entry point. `update_all_sources()` runs every source and skips the wiki, with a message, if its cookies have expired.
 
 ```text
-update_jira_knowledge()
-update_markdown_knowledge()
-update_video_knowledge()
+update_jira_knowledge(full_refresh=False)
 update_website_knowledge()
-update_wiki_knowledge()
+update_video_knowledge()
+update_wiki_knowledge(max_pages=None)
 update_all_sources()
-update_knowledge_base()
+update_knowledge_base()   # not ported yet, raises NotImplementedError
 ```
+
+## Setup
+
+```bash
+pip install -r requirements
+python -m spacy download en_core_web_lg   # model used by Presidio for PII scrubbing
+playwright install chromium               # headless browser for the wiki login
+```
+
+Copy `.env.example` to `.env` and fill in the JIRA and Open WebUI settings. The wiki needs no credentials in `.env`; see [Wiki login](#wiki-login).
 
 ## Local Document Updates
 
-Each source uses a stable identifier when generating its local filename.
-
-Examples:
-
-```text
-JIRA issue key       -> jira_SUP-1234.md
-YouTube video ID     -> youtube_abc123.md
-GitHub source path   -> tutorials_slurm.md
-Website URL/path     -> userinfo_rivanna_overview.md
-Wiki page ID/path    -> wiki_184928.md
-```
-
-When a document is scraped, its newly generated content is compared with the existing local file.
+Each source uses a stable identifier for its filename, so a rerun overwrites a document instead of creating a duplicate. Newly generated content is compared with the existing file:
 
 ```text
 File does not exist       -> Created
@@ -98,64 +67,54 @@ File exists and is same   -> Unchanged
 File exists and changed   -> Updated
 ```
 
-Existing files are overwritten when their source content changes rather than creating duplicate local files.
+Every run prints and returns the same summary:
+
+```text
+Fetched     items the source offered and this run attempted
+Created / Updated / Unchanged
+Skipped     nothing worth saving (empty page, form-only ticket)
+Failed      error while processing that item
+```
+
+Video and wiki runs also list **stale files**: documents in the output folder whose source no longer exists (a deleted wiki page, a video removed from the playlist). They are reported, not deleted.
 
 ## Running the Scrapers
 
 Run commands from the repository root.
 
-### JIRA
-
 ```bash
-python run.py jira
+python run.py                    # all sources
+python run.py --jira             # recent tickets (updated in the last 2 days)
+python run.py --jira --full      # all tickets
+python run.py --website
+python run.py --video
+python run.py --wiki
+python run.py --wiki --max-pages 5   # quick test
 ```
 
-### Video
-
-```bash
-python run.py video
-```
-
-### Markdown / RC Learning
-
-```bash
-python run.py markdown
-```
-
-Additional individual source commands can be added as the Website and Wiki managers are integrated.
-
-### All Sources
-
-```bash
-python run.py scrape
-```
-
-This runs all currently integrated source updates and generates/updates the local Markdown documents under `data/`.
+Flags can be combined, e.g. `python run.py --jira --video`.
 
 **Running a scraper does not upload files to Open WebUI.**
 
+### Wiki login
+
+The RCI wiki is behind NetBadge, which requires a Duo approval on a phone, so the wiki scraper reads saved cookies instead of logging in itself:
+
+```bash
+python run.py --wiki-login
+```
+
+This asks for your computing ID and password, prints a 3-digit Duo code to enter in Duo Mobile, and saves the cookies to `scrapers/auth_cookies.json` (git-ignored; set `WIKI_AUTH_COOKIES_PATH` to use another location). It replaces the older `scrapers/save_auth.py`.
+
+The cookies have been seen to expire in under 7.5 hours. When they do, the wiki is skipped with a message and the other sources still run; log in again and rerun `python run.py --wiki`.
+
 ## Uploading to Open WebUI
 
-Uploading is a separate operation:
+Uploading is being ported to `business_v2.py` and is not available yet: `tasks.update_knowledge_base()` raises `NotImplementedError` and `run.py` has no upload option.
 
-```bash
-python run.py upload
-```
+The previous uploader re-sent every file on each run and never removed the old copies, so the knowledge base accumulated duplicates. The port is expected to upload only `changed_files` and replace the earlier copy of an updated document.
 
-This recursively discovers `.md` and `.txt` files under `data/` and uses `UVARCKnowledgeBaseManager` to upload them and attach them to the configured Open WebUI knowledge base.
-
-Configure the required Open WebUI and source credentials in `.env` before running the application.
-
-## Full Manual Refresh
-
-To update all local knowledge documents and then upload them:
-
-```bash
-python run.py scrape
-python run.py upload
-```
-
-These operations remain separate so generated knowledge documents can be inspected before they are uploaded.
+Upload remains a separate step from scraping, so generated documents can be inspected before they are uploaded.
 
 
 ## Unified Services Repo Outline via Mohamed

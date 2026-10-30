@@ -1,19 +1,37 @@
+import json
 import os
 import re
 import time
 import xml.etree.ElementTree as ET
 from html import unescape
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import cloudscraper
+import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from jira import JIRA
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
+from youtube_transcript_api import (
+    NoTranscriptFound,
+    TranscriptsDisabled,
+    YouTubeTranscriptApi,
+)
+from yt_dlp import YoutubeDL
+
+from common_service_handlers.jira_service_handler import JiraServiceHandler
 
 load_dotenv()
+
+
+class WikiAuthenticationError(RuntimeError):
+    """Raised when the saved NetBadge cookies are missing or expired.
+
+    Refreshing them needs a Duo push approved on a phone, so this can never
+    be recovered from automatically. Callers should surface it as an alert
+    rather than retry.
+    """
 
 
 class RCKBKnowledgeManager:
@@ -64,8 +82,77 @@ class RCKBKnowledgeManager:
         "AND status != Open "
     )
 
-    def __init__(self, output_folder):
-        self.output_folder = Path(output_folder)
+    # YouTube
+    VIDEO_PLAYLIST_URL = (
+        "https://www.youtube.com/playlist?list=PLT4bryHgBcRP7N-hB9u6EWs6tq_2nMoRO"
+    )
+    VIDEO_REQUEST_DELAY = 1.0  # seconds between videos; the transcript API rate-limits
+
+    # RCI wiki (Gitit behind NetBadge)
+    WIKI_BASE_URL = "https://rci.hpc.virginia.edu/wiki/"
+    WIKI_INDEX_URL = "https://rci.hpc.virginia.edu/wiki/_index"
+    WIKI_LOGIN_TARGET = "https://rci.hpc.virginia.edu/wiki/"
+    WIKI_REQUEST_DELAY = 0.3  # seconds between page requests
+    # Gitit special paths and old wiki sections we never want indexed
+    WIKI_SKIP_PATH_SEGMENTS = (
+        "/_edit/",
+        "/_history/",
+        "/_discuss/",
+        "/_delete/",
+        "/_login",
+        "/_logout",
+        "/_index",
+        "/_categories",
+        "/_random",
+        "/_search",
+        "/_upload",
+        "/_activity",
+        "/_export",
+        "/OldWiki",
+        "/OldOldWiki",
+    )
+    # Tags that end a line. Everything else (<code>, <a>, <strong>, ...) stays
+    # inline, or sentences get chopped up around every command name.
+    WIKI_BLOCK_TAGS = (
+        "p", "div", "br", "hr",
+        "h1", "h2", "h3", "h4", "h5", "h6",
+        "li", "ul", "ol", "dl", "dt", "dd",
+        "pre", "blockquote",
+        "table", "tr", "thead", "tbody",
+        "section", "article", "header", "footer",
+    )
+
+    # Each source writes into its own subfolder of the knowledge base folder.
+    # data/knowledgebase/ itself is committed to GitHub; these subfolders are
+    # git-ignored (see data/knowledgebase/.gitignore).
+    SOURCE_SUBFOLDERS = {
+        "website": "website",
+        "jira": "jira",
+        "videos": "videos",
+        "wiki": "wiki",
+    }
+
+    @staticmethod
+    def default_knowledgebase_folder():
+        # <repo>/data/knowledgebase. Set KNOWLEDGEBASE_DIR to override.
+        # The repo root is found by walking up from this file to the first
+        # folder that holds both app/ and data/, so it keeps working however
+        # deep the RAG app folder ends up.
+        override = os.getenv("KNOWLEDGEBASE_DIR")
+        if override:
+            return Path(override)
+
+        for parent in Path(__file__).resolve().parents:
+            if (parent / "app").is_dir() and (parent / "data").is_dir():
+                return parent / "data" / "knowledgebase"
+
+        raise RuntimeError(
+            "Could not find the repo's data/ folder from "
+            f"{Path(__file__).resolve()}. Set KNOWLEDGEBASE_DIR."
+        )
+
+    def __init__(self, output_folder=None, jira_service_handler=None):
+        self.output_folder = Path(output_folder or self.default_knowledgebase_folder())
         self.output_folder.mkdir(parents=True, exist_ok=True)
 
         # rc.virginia.edu intermittently returns 403s to automated requests
@@ -75,20 +162,22 @@ class RCKBKnowledgeManager:
             browser={"browser": "chrome", "platform": "windows", "desktop": True}
         )
 
-        # Created on first use, so website-only runs don't need JIRA
-        # credentials or the Presidio models.
-        self._jira = None
+        # Created on first use, so website-only runs don't need the Flask app
+        # config or the Presidio models. A handler can also be passed in
+        # (e.g. the shared one from app, or a fake in tests).
+        self._jira_service = jira_service_handler
         self._analyzer = None
         self._anonymizer = None
 
     @property
-    def jira(self):
-        if self._jira is None:
-            self._jira = JIRA(
-                server=os.getenv("JIRA_SERVER"),
-                basic_auth=(os.getenv("JIRA_EMAIL"), os.getenv("JIRA_API_TOKEN")),
-            )
-        return self._jira
+    def jira_service(self):
+        if self._jira_service is None:
+            # Imported here rather than at module level: app imports the
+            # business modules, so a top-level import risks a circular import.
+            from app import app
+
+            self._jira_service = JiraServiceHandler(app)
+        return self._jira_service
 
     @property
     def analyzer(self):
@@ -125,6 +214,27 @@ class RCKBKnowledgeManager:
         stats[status] += 1
         if status in ("created", "updated"):
             stats["changed_files"].append(result["file"])
+
+    def source_folder(self, source):
+        folder = self.output_folder / self.SOURCE_SUBFOLDERS[source]
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _find_stale_files(self, source, prefix, expected_filenames):
+        # Documents left over from earlier runs whose source no longer exists
+        # (page deleted, video removed from the playlist). Only listed, never
+        # deleted: a source that is briefly unreachable would otherwise wipe
+        # its documents.
+        stale = sorted(
+            path
+            for path in self.source_folder(source).glob(f"{prefix}*.md")
+            if path.name not in expected_filenames
+        )
+        if stale:
+            print(f"Stale files (source no longer lists them): {len(stale)}")
+            for path in stale:
+                print(f"  {path.name}")
+        return stale
 
     def build_generation_result(
         self,
@@ -171,10 +281,10 @@ class RCKBKnowledgeManager:
         return filename[:maxLength]
 
     # Saving utility used by scrapers to generate update summaries
-    def save_document(self, filename, content):
+    def save_document(self, source, filename, content):
         if not filename.endswith(".md"):
             filename += ".md"
-        file_path = self.output_folder / filename
+        file_path = self.source_folder(source) / filename
 
         content = content.strip() + "\n"
 
@@ -240,7 +350,7 @@ class RCKBKnowledgeManager:
         )
 
     def _doc_path(self, url):
-        return self.output_folder / f"{self.generate_sanitized_filename(url)}.md"
+        return self.source_folder("website") / f"{self.generate_sanitized_filename(url)}.md"
 
     def _fetch(self, url, retries=3):
         # Retry requests that bot protection or rate limiting turned away
@@ -324,7 +434,7 @@ class RCKBKnowledgeManager:
                 print(f"Skipping {url} (no single article)")
                 stats["skipped"] += 1
             else:
-                result = self.save_document(self.generate_sanitized_filename(url), text)
+                result = self.save_document("website", self.generate_sanitized_filename(url), text)
                 self._record(stats, result)
                 print(f"Extracted ({result['status']}): {url}")
 
@@ -412,7 +522,7 @@ class RCKBKnowledgeManager:
                     stats["skipped"] += 1
                 else:
                     result = self.save_document(
-                        self.generate_sanitized_filename(url), text
+                        "website", self.generate_sanitized_filename(url), text
                     )
                     self._record(stats, result)
                     print(f"Added: {url}")
@@ -450,7 +560,7 @@ class RCKBKnowledgeManager:
                 print(f"Already has content: {url}")
                 continue
 
-            result = self.save_document(self.generate_sanitized_filename(url), text)
+            result = self.save_document("website", self.generate_sanitized_filename(url), text)
             self._record(stats, result)
             patched += 1
             print(f"Patched: {url}")
@@ -477,33 +587,34 @@ class RCKBKnowledgeManager:
         next_page_token = None
 
         while True:
-            batch = self.jira.enhanced_search_issues(
+            batch = self.jira_service.search_issues(
                 jql,
-                maxResults=100,
                 fields=["summary", "description", "comment"],
                 expand="renderedFields",
-                nextPageToken=next_page_token,
+                max_results=100,
+                next_page_token=next_page_token,
             )
-            issues.extend(batch)
+            issues.extend(batch.get("issues", []))
             print(f"Fetched {len(issues)} JIRA issues so far...")
 
-            next_page_token = getattr(batch, "nextPageToken", None)
-            if not next_page_token:
+            next_page_token = batch.get("nextPageToken")
+            if not next_page_token or batch.get("isLast"):
                 break
 
         return issues
 
+    # Issues are raw REST API dicts:
+    # {"key": ..., "fields": {...}, "renderedFields": {...}}
+
     # Description processing
     def _get_description(self, issue):
-        rendered_description = ""
-
-        if hasattr(issue, "renderedFields"):
-            rendered_description = (
-                getattr(issue.renderedFields, "description", "") or ""
-            )
+        rendered_fields = issue.get("renderedFields") or {}
+        rendered_description = rendered_fields.get("description") or ""
 
         if not rendered_description:
-            raw_description = issue.fields.description
+            # API v3 returns the raw description as an ADF dict, so this
+            # fallback only applies to plain-string descriptions
+            raw_description = (issue.get("fields") or {}).get("description")
             if isinstance(raw_description, str):
                 rendered_description = raw_description
 
@@ -528,28 +639,23 @@ class RCKBKnowledgeManager:
 
     # Comment processing
     def _extract_comments(self, issue):
-        raw_comments = []
-        if hasattr(issue.fields, "comment") and issue.fields.comment:
-            raw_comments = issue.fields.comment.comments
+        fields = issue.get("fields") or {}
+        raw_comments = (fields.get("comment") or {}).get("comments") or []
 
-        rendered_comments = []
-        if hasattr(issue, "renderedFields"):
-            rendered_comment_object = getattr(issue.renderedFields, "comment", None)
-            if rendered_comment_object:
-                rendered_comments = getattr(rendered_comment_object, "comments", [])
+        rendered_fields = issue.get("renderedFields") or {}
+        rendered_comments = (rendered_fields.get("comment") or {}).get("comments") or []
 
         comments = []
         for index, raw_comment in enumerate(raw_comments):
-            author = "Unknown"
-            if getattr(raw_comment, "author", None):
-                author = raw_comment.author.displayName
+            author = (raw_comment.get("author") or {}).get("displayName") or "Unknown"
 
             rendered_body = ""
             if index < len(rendered_comments):
-                rendered_body = getattr(rendered_comments[index], "body", "") or ""
+                rendered_body = rendered_comments[index].get("body") or ""
 
-            if not rendered_body and isinstance(raw_comment.body, str):
-                rendered_body = raw_comment.body
+            raw_body = raw_comment.get("body")
+            if not rendered_body and isinstance(raw_body, str):
+                rendered_body = raw_body
 
             body = self.strip_html_tags(rendered_body)
             if body:
@@ -594,9 +700,11 @@ class RCKBKnowledgeManager:
             for comment in self._extract_comments(issue)
         ]
 
+        summary = (issue.get("fields") or {}).get("summary") or ""
+
         return {
-            "key": issue.key,
-            "summary": self._scrub_text((issue.fields.summary or "").strip()),
+            "key": issue["key"],
+            "summary": self._scrub_text(summary.strip()),
             "description": self._scrub_text(description),
             "comments": processed_comments,
         }
@@ -642,6 +750,7 @@ class RCKBKnowledgeManager:
 
     def _save_jira_issue(self, issue):
         return self.save_document(
+            "jira",
             f"jira_{issue['key']}.md",
             self._build_jira_markdown(issue),
         )
@@ -671,6 +780,720 @@ class RCKBKnowledgeManager:
 
             except Exception as error:
                 stats["failed"] += 1
-                print(f"Failed to process {issue.key}: {error}")
+                print(f"Failed to process {issue.get('key', 'Unknown')}: {error}")
 
         return self.build_generation_result(**stats)
+
+    ############################
+    #       VIDEO LOGIC        #
+    ############################
+
+    def _fetch_playlist(self):
+        ydl_options = {
+            "extract_flat": True,
+            "quiet": True,
+        }
+        with YoutubeDL(ydl_options) as ydl:
+            info = ydl.extract_info(self.VIDEO_PLAYLIST_URL, download=False)
+
+        entries = info.get("entries", [])
+        print(f"Found {len(entries)} videos in: {info.get('title', 'Unknown')}")
+        return entries
+
+    def _get_video_metadata(self, video_url):
+        ydl_options = {
+            "quiet": True,
+            "skip_download": True,
+        }
+        with YoutubeDL(ydl_options) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+
+        return {
+            "title": info.get("title", ""),
+            "author": info.get("uploader", ""),
+            "description": info.get("description", ""),
+            "length": info.get("duration", 0),
+            "publish_date": info.get("upload_date", ""),
+            "webpage_url": info.get("webpage_url", video_url),
+        }
+
+    def _get_transcript(self, video_id):
+        # A video without English captions is still worth keeping for its
+        # title and description. Rate limits (IpBlocked/RequestBlocked) are
+        # not caught here, so they still count as failures.
+        try:
+            transcript = YouTubeTranscriptApi().fetch(video_id, languages=["en"])
+        except (NoTranscriptFound, TranscriptsDisabled):
+            print(f"  No English transcript for {video_id}")
+            return "No transcript available."
+
+        return " ".join(
+            entry.text.strip() for entry in transcript if entry.text.strip()
+        )
+
+    @staticmethod
+    def _video_id(entry):
+        # Works for playlist entries and for _process_video() results
+        return entry.get("id") or entry["url"].split("v=")[-1]
+
+    def _video_filename(self, entry):
+        return f"youtube_{self._video_id(entry)}.md"
+
+    def _process_video(self, entry):
+        video_url = entry["url"]
+        video_id = self._video_id(entry)
+
+        return {
+            "id": video_id,
+            "metadata": self._get_video_metadata(video_url),
+            "transcript": self._get_transcript(video_id),
+        }
+
+    def _build_video_markdown(self, video):
+        metadata = video["metadata"]
+
+        return f"""# {metadata["title"]}
+
+## Video Information
+
+**Source:** YouTube
+
+**Author:** {metadata["author"]}
+
+**URL:** {metadata["webpage_url"]}
+
+**Publish Date:** {metadata["publish_date"]}
+
+---
+
+## Description
+
+{metadata["description"]}
+
+---
+
+## Transcript
+
+{video["transcript"]}
+""".strip() + "\n"
+
+    def _save_video(self, video):
+        return self.save_document(
+            "videos",
+            self._video_filename(video),
+            self._build_video_markdown(video),
+        )
+
+    # Video generation
+    def generate_video_knowledge(self, max_videos=None):
+        print("Starting video knowledge generation...")
+        entries = self._fetch_playlist()
+        all_entries = entries
+        if max_videos:
+            entries = entries[:max_videos]
+
+        stats = self._new_stats()
+        stats["fetched"] = len(entries)
+
+        for entry in entries:
+            try:
+                video = self._process_video(entry)
+                result = self._save_video(video)
+                self._record(stats, result)
+                print(f"{result['status'].capitalize()}: {result['file'].name}")
+
+            except Exception as error:
+                stats["failed"] += 1
+                print(f"Failed to process {entry.get('title', 'Unknown')}: {error}")
+
+            time.sleep(self.VIDEO_REQUEST_DELAY)
+
+        result = self.build_generation_result(**stats)
+
+        # A partial run (max_videos) would flag every unvisited video
+        if not max_videos:
+            result["stale_files"] = self._find_stale_files(
+                "videos",
+                "youtube_",
+                {self._video_filename(entry) for entry in all_entries},
+            )
+        return result
+
+    ############################
+    #        WIKI LOGIC        #
+    ############################
+
+    @staticmethod
+    def wiki_default_cookies_path():
+        # Kept outside the repo on purpose: these cookies are a live NetBadge
+        # session and must never be committed. Set WIKI_AUTH_COOKIES_PATH to
+        # put them somewhere else.
+        return Path.home() / ".config" / "uvarc-rag" / "netbadge_cookies.json"
+
+    def _make_wiki_session(self, cookies_path=None):
+        # Load the NetBadge cookies saved by netbadge_login()
+        cookies_path = Path(
+            cookies_path
+            or os.getenv("WIKI_AUTH_COOKIES_PATH")
+            or self.wiki_default_cookies_path()
+        )
+        if not cookies_path.exists():
+            raise WikiAuthenticationError(
+                f"{cookies_path} not found. Run netbadge_login() to create it."
+            )
+
+        session = requests.Session()
+        for cookie in json.loads(cookies_path.read_text(encoding="utf-8")):
+            session.cookies.set(
+                cookie["name"],
+                cookie["value"],
+                domain=cookie.get("domain", "").lstrip("."),
+                path=cookie.get("path", "/"),
+            )
+        session.headers.update(
+            {"User-Agent": "Mozilla/5.0 (compatible; UVA-RC-RAG-Scraper/1.0)"}
+        )
+        return session
+
+    def _check_wiki_session(self, response):
+        # A NetBadge page returned with HTTP 200 means the cookies died
+        # mid-run. Fail loudly instead of saving login pages as documents.
+        if "NetBadge" in response.text or "shibidp" in response.url:
+            raise WikiAuthenticationError(
+                "NetBadge redirect — cookies expired. Re-run netbadge_login()."
+            )
+
+    def _should_skip_wiki_url(self, url):
+        parsed = urlparse(url)
+
+        # "?printable" and "?revision=" map to the same filename as the plain
+        # page and would overwrite it
+        if parsed.query:
+            return True
+
+        if parsed.path.lower().endswith(self.SKIP_EXTENSIONS):
+            return True
+
+        return any(segment in parsed.path for segment in self.WIKI_SKIP_PATH_SEGMENTS)
+
+    def _wiki_page_title(self, url):
+        path = urlparse(url).path
+        if path.startswith("/wiki/"):
+            return unquote(path[len("/wiki/"):])
+        return url
+
+    def _get_wiki_page_urls(self, session):
+        # _index only lists the top level. Subdirectories show up as
+        # <li class="folder"> links (e.g. /wiki/Guides/) whose own listing has
+        # to be expanded in turn. The front page is not listed anywhere.
+        urls = [self.WIKI_BASE_URL]
+        folders = [self.WIKI_INDEX_URL]
+        seen_folders = set(folders)
+
+        while folders:
+            folder_url = folders.pop(0)
+            response = session.get(folder_url, timeout=20)
+            self._check_wiki_session(response)
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            entries = soup.select("li.page, li.folder")
+            if not entries:
+                print(f"Could not find page listing on {folder_url}")
+                continue
+
+            for entry in entries:
+                a_tag = entry.find("a", href=True)
+                if not a_tag:
+                    continue
+
+                url = urljoin(folder_url, a_tag["href"]).split("#")[0]
+                if "/wiki/" not in url or self._should_skip_wiki_url(url):
+                    continue
+
+                if "folder" in entry.get("class", []):
+                    if url not in seen_folders:
+                        seen_folders.add(url)
+                        folders.append(url)
+                else:
+                    urls.append(url)
+
+            time.sleep(self.WIKI_REQUEST_DELAY)
+
+        print(f"Expanded {len(seen_folders) - 1} folders")
+        return list(dict.fromkeys(urls))
+
+    def _get_wiki_soup(self, session, url):
+        response = session.get(url, timeout=20)
+        if response.status_code != 200:
+            return None
+
+        self._check_wiki_session(response)
+
+        if "text/html" not in response.headers.get("Content-Type", ""):
+            return None
+        return BeautifulSoup(response.text, "html.parser")
+
+    def _fetch_wiki_page(self, session, url):
+        # Returns (url, soup). Gitit's listing drops a leading space from page
+        # names, so "HPC Support/ SLURM" is listed as ".../SLURM" and 404s.
+        # Retry with the space put back.
+        soup = self._get_wiki_soup(session, url)
+        if soup is not None:
+            return url, soup
+
+        head, _, name = url.rpartition("/")
+        spaced_url = f"{head}/%20{name}"
+        soup = self._get_wiki_soup(session, spaced_url)
+        if soup is not None:
+            return spaced_url, soup
+
+        return url, None
+
+    def _scrub_wiki_text(self, text):
+        # Wiki pages are full of module names (gcc9, cuda11) that UVA_ID_RE
+        # matches, and Presidio reads command and host names as PERSON, so
+        # only emails and phone numbers are scrubbed here
+        if not text:
+            return text
+
+        results = self.analyzer.analyze(
+            text=text,
+            language="en",
+            entities=["EMAIL_ADDRESS", "PHONE_NUMBER"],
+        )
+        return self.anonymizer.anonymize(text=text, analyzer_results=results).text
+
+    def _wiki_soup_to_text(self, node):
+        # get_text(separator="\n") would put every inline tag on its own line,
+        # so mark the block boundaries first and then join with nothing
+        for tag in node.find_all(self.WIKI_BLOCK_TAGS):
+            tag.insert_before("\n")
+            tag.insert_after("\n")
+
+        # Keep table cells apart on the same line
+        for tag in node.find_all(["td", "th"]):
+            tag.insert_after(" ")
+
+        return node.get_text()
+
+    def _parse_wiki_page(self, url, soup, scrub_pii=True):
+        # Returns {"title", "text", "source", "tags"} for one Gitit page, or None
+        wikipage = soup.find(id="wikipage")
+        if not wikipage:
+            return None
+
+        for element in wikipage.select("#TOC, .editsection, .footnotes"):
+            element.decompose()
+
+        for tag in wikipage.find_all("img"):
+            tag.decompose()
+
+        # Take the title from the <h1> and drop it; _build_wiki_markdown adds
+        # the heading back
+        title_tag = wikipage.find("h1")
+        title = title_tag.get_text(strip=True) if title_tag else self._wiki_page_title(url)
+        if title_tag:
+            title_tag.decompose()
+
+        for a_tag in wikipage.find_all("a", href=True):
+            href = a_tag["href"]
+            if not href.startswith("http"):
+                href = urljoin(url, href)
+            a_tag["href"] = href
+            link_text = a_tag.get_text(strip=True)
+            if link_text:
+                a_tag.string = f"[{link_text}]({href})"
+
+        text = self._wiki_soup_to_text(wikipage)
+
+        # clean_markdown_text only drops .png references
+        text = re.sub(r"\S+\.(?:jpg|jpeg|gif|svg|webp)", "", text)
+        text = self.clean_markdown_text(text).strip()
+        if not text:
+            return None
+
+        category_div = soup.find(id="categories") or soup.find(class_="categories")
+        categories = (
+            [a_tag.get_text(strip=True) for a_tag in category_div.find_all("a")]
+            if category_div
+            else []
+        )
+
+        if scrub_pii:
+            title = self._scrub_wiki_text(title)
+            text = self._scrub_wiki_text(text)
+
+        return {
+            "title": title,
+            "text": text,
+            "source": url,
+            "tags": ["wiki"] + categories,
+        }
+
+    def _build_wiki_markdown(self, page):
+        title = page["title"] or "Wiki Page"
+        text = page["text"]
+        body = text if text.startswith("#") else f"# {title}\n\n{text}"
+
+        return f"""{body}
+
+---
+
+## Wiki Page
+
+**Source:** {page["source"]}
+
+**Tags:** {", ".join(page["tags"])}
+"""
+
+    def _wiki_filename(self, url):
+        # Named from the URL path, not the title: two pages can share an <h1>.
+        # Each segment is stripped so "HPC Support/ SLURM" does not become a
+        # double underscore.
+        title = "/".join(part.strip() for part in self._wiki_page_title(url).split("/"))
+        slug = re.sub(r"\s+", "_", title)
+        slug = self.generate_sanitized_filename(slug, 150, True).strip("_")
+        return f"wiki_{slug or 'index'}.md"
+
+    # Wiki generation
+    def generate_wiki_knowledge(self, cookies_path=None, max_pages=None, scrub_pii=True):
+        # Needs valid NetBadge cookies. They cannot be refreshed unattended
+        # (Duo push), so WikiAuthenticationError aborts the run instead of
+        # being counted as a failed page.
+        print("Starting wiki knowledge generation...")
+        session = self._make_wiki_session(cookies_path)
+
+        response = session.get(self.WIKI_BASE_URL, timeout=20)
+        self._check_wiki_session(response)
+
+        page_urls = self._get_wiki_page_urls(session)
+        print(f"Found {len(page_urls)} wiki pages")
+        # Leading-space pages map to the same filename as their listed URL
+        expected_filenames = {self._wiki_filename(url) for url in page_urls}
+        if max_pages:
+            page_urls = page_urls[:max_pages]
+
+        stats = self._new_stats()
+        stats["fetched"] = len(page_urls)
+
+        for index, url in enumerate(page_urls, 1):
+            print(f"  [{index}/{len(page_urls)}] {self._wiki_page_title(url) or '(front page)'}")
+            try:
+                url, soup = self._fetch_wiki_page(session, url)
+                if soup is None:
+                    print("    Skipped (page not found)")
+                    stats["skipped"] += 1
+                    continue
+
+                page = self._parse_wiki_page(url, soup, scrub_pii)
+                if page is None:
+                    print("    Skipped (no content)")
+                    stats["skipped"] += 1
+                    continue
+
+                result = self.save_document(
+                    "wiki", self._wiki_filename(url), self._build_wiki_markdown(page)
+                )
+                self._record(stats, result)
+                print(f"    {result['status'].capitalize()}: {result['file'].name}")
+
+            except WikiAuthenticationError:
+                raise
+
+            except Exception as error:
+                stats["failed"] += 1
+                print(f"    Failed: {error}")
+
+            time.sleep(self.WIKI_REQUEST_DELAY)
+
+        result = self.build_generation_result(**stats)
+
+        # A partial run (max_pages) would flag every unvisited page
+        if not max_pages:
+            result["stale_files"] = self._find_stale_files("wiki", "wiki_", expected_filenames)
+        return result
+
+
+############################
+#   WIKI NETBADGE LOGIN    #
+############################
+
+
+def netbadge_login(
+    username,
+    password,
+    target=None,
+    output=None,
+    timeout=120,
+    debug_dir=None,
+):
+    """Log in through NetBadge + Duo and save the session cookies to `output`.
+
+    Runs a headless Chromium via Playwright's *sync* API, so it must not be
+    called from inside a running asyncio event loop (that is why the notebook
+    used the async API). Intended to be driven by an interactive script,
+    where a human is present to approve the Duo push.
+
+    When `debug_dir` is given, the Duo page and any timeout are captured as
+    screenshots there. Duo can block headless browsers outright, and the
+    screenshot is usually the only way to see why.
+    """
+
+    from playwright.sync_api import sync_playwright
+
+    target = target or RCKBKnowledgeManager.WIKI_LOGIN_TARGET
+    output = Path(output or RCKBKnowledgeManager.wiki_default_cookies_path())
+
+    username_selector = (
+        "input[name='j_username'], "
+        "input[name='username'], "
+        "input[id='username']"
+    )
+
+    password_selector = (
+        "input[name='j_password'], "
+        "input[name='password'], "
+        "input[id='password']"
+    )
+
+    if debug_dir:
+        debug_dir = Path(debug_dir)
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_debug(page, name):
+        if not debug_dir:
+            return
+
+        try:
+            path = debug_dir / f"{name}.png"
+            page.screenshot(path=str(path))
+            print(f"  Screenshot saved -> {path}")
+        except Exception as error:
+            print(f"  [warn] Could not capture {name}: {error}")
+
+    # Duo Verified Push shows a 3-digit code in the browser that has to be
+    # typed into Duo Mobile. Headless means nobody can see it, so pull it out
+    # of the page and print it. The code renders a moment after the push is
+    # triggered, so this gets called repeatedly until it turns up.
+    seen_codes = set()
+    seen_snippets = set()
+
+    def report_duo_code(page):
+
+        try:
+            body_text = page.locator("body").inner_text()
+        except Exception:
+            return
+
+        codes = re.findall(
+            r"(?<!\d)(\d{3})(?!\d)",
+            body_text,
+        )
+
+        for code in codes:
+            if code in seen_codes:
+                continue
+
+            seen_codes.add(code)
+
+            print()
+            print("  " + "=" * 44)
+            print(
+                f"  DUO CODE: {code}   "
+                "<- enter this in Duo Mobile"
+            )
+            print("  " + "=" * 44)
+            print(flush=True)
+
+        if not codes and not seen_codes:
+            # No 3-digit code found. Show the page text instead, so a
+            # 2-digit code, a device picker or a bot block is still visible.
+            # Only on change, or it repeats on every poll.
+            snippet = " | ".join(
+                line.strip()
+                for line in body_text.splitlines()
+                if line.strip()
+            )[:400]
+
+            if snippet and snippet not in seen_snippets:
+                seen_snippets.add(snippet)
+                print(f"  Duo page: {snippet}", flush=True)
+
+    print("Launching headless browser ...", flush=True)
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+
+        try:
+            page.goto(target, timeout=30000)
+            page.wait_for_load_state(
+                "domcontentloaded",
+                timeout=20000,
+            )
+            page.wait_for_timeout(2000)
+
+            # Step 1: the certificate-auth failure page, if it appears
+
+            for _ in range(4):
+                if page.locator("#wikipage").count() > 0:
+                    break
+
+                if (
+                    "my.policy" in page.url
+                    or "Certificate Login Failed" in page.content()
+                ):
+                    print(
+                        "  Certificate auth failed page "
+                        "— clicking Continue ..."
+                    )
+
+                    page.locator(
+                        "a:has-text('Continue'), "
+                        "input[value='Continue'], "
+                        "button:has-text('Continue')"
+                    ).first.click()
+
+                    page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=20000,
+                    )
+                    page.wait_for_timeout(2000)
+
+                    print(f"  Now at: {page.url}")
+
+                if page.locator(username_selector).count() > 0:
+                    page.locator(username_selector).first.fill(username)
+                    page.locator(password_selector).first.fill(password)
+
+                    # Enter submits the password form only. Clicking the
+                    # visible button can hit the separate certificate-login
+                    # form instead.
+                    page.locator(password_selector).first.press("Enter")
+
+                    page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=30000,
+                    )
+                    page.wait_for_timeout(2000)
+
+                    print(f"  URL after submit: {page.url}")
+
+                    # A rejected password re-renders the NetBadge form, so
+                    # without this the Duo wait below would just time out
+                    if "Incorrect computing ID or password" in page.content():
+                        raise WikiAuthenticationError(
+                            "Incorrect computing ID or password."
+                        )
+                    break
+
+            # Step 2: Duo two-factor
+
+            if page.locator("#wikipage").count() == 0:
+                page.wait_for_timeout(3000)
+
+                for push_text in [
+                    "Send Me a Push",
+                    "Send push",
+                    "Push",
+                    "Send request",
+                ]:
+                    push_button = page.locator(
+                        f"button:has-text('{push_text}'), "
+                        f"input[value='{push_text}'], "
+                        f"a:has-text('{push_text}')"
+                    )
+
+                    if push_button.count() > 0:
+                        print(f"  Clicking Duo button: '{push_text}'")
+                        push_button.first.click()
+                        page.wait_for_timeout(1500)
+                        break
+
+                save_debug(page, "debug_duo")
+
+                # Give the prompt a moment to render the code, then read it.
+                page.wait_for_timeout(2000)
+                report_duo_code(page)
+
+                print()
+                print(
+                    "Waiting for you to approve the Duo push "
+                    "on your phone ...",
+                    flush=True,
+                )
+
+            # Step 3: wait for the wiki itself
+
+            deadline = time.time() + timeout
+
+            while time.time() < deadline:
+                current_url = page.url
+
+                if (
+                    "rci.hpc.virginia.edu/wiki/" in current_url
+                    and "shibidp" not in current_url
+                    and "duosecurity" not in current_url
+                ):
+                    break
+
+                print(
+                    f"  [{int(deadline - time.time())}s left] "
+                    f"URL: {current_url}",
+                    flush=True,
+                )
+
+                if "duosecurity" in current_url:
+                    report_duo_code(page)
+
+                for button_text in [
+                    "Trust this browser",
+                    "Stay signed in",
+                    "Yes",
+                    "Continue",
+                    "Proceed",
+                ]:
+                    button = page.locator(
+                        f"button:has-text('{button_text}'), "
+                        f"input[value='{button_text}']"
+                    )
+
+                    if button.count() > 0:
+                        print(
+                            "  Clicking intermediate button: "
+                            f"'{button_text}'"
+                        )
+                        button.first.click()
+                        page.wait_for_load_state(
+                            "domcontentloaded",
+                            timeout=15000,
+                        )
+                        break
+
+                page.wait_for_timeout(5000)
+            else:
+                save_debug(page, "debug_final")
+
+                raise WikiAuthenticationError(
+                    "NetBadge/Duo login timed out. "
+                    f"Final URL: {page.url}"
+                )
+
+            print("Login successful!")
+
+            cookies = context.cookies()
+
+            output.parent.mkdir(parents=True, exist_ok=True)
+
+            output.write_text(
+                json.dumps(cookies, indent=2),
+                encoding="utf-8",
+            )
+
+            print(f"Saved {len(cookies)} cookies -> {output}")
+
+            return output
+
+        finally:
+            browser.close()

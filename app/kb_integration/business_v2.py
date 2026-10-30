@@ -11,7 +11,6 @@ import cloudscraper
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from jira import JIRA
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
 from youtube_transcript_api import (
@@ -20,6 +19,8 @@ from youtube_transcript_api import (
     YouTubeTranscriptApi,
 )
 from yt_dlp import YoutubeDL
+
+from common_service_handlers.jira_service_handler import JiraServiceHandler
 
 load_dotenv()
 
@@ -121,8 +122,37 @@ class RCKBKnowledgeManager:
         "section", "article", "header", "footer",
     )
 
-    def __init__(self, output_folder):
-        self.output_folder = Path(output_folder)
+    # Each source writes into its own subfolder of the knowledge base folder.
+    # data/knowledgebase/ itself is committed to GitHub; these subfolders are
+    # git-ignored (see data/knowledgebase/.gitignore).
+    SOURCE_SUBFOLDERS = {
+        "website": "website",
+        "jira": "jira",
+        "videos": "videos",
+        "wiki": "wiki",
+    }
+
+    @staticmethod
+    def default_knowledgebase_folder():
+        # <repo>/data/knowledgebase. Set KNOWLEDGEBASE_DIR to override.
+        # The repo root is found by walking up from this file to the first
+        # folder that holds both app/ and data/, so it keeps working however
+        # deep the RAG app folder ends up.
+        override = os.getenv("KNOWLEDGEBASE_DIR")
+        if override:
+            return Path(override)
+
+        for parent in Path(__file__).resolve().parents:
+            if (parent / "app").is_dir() and (parent / "data").is_dir():
+                return parent / "data" / "knowledgebase"
+
+        raise RuntimeError(
+            "Could not find the repo's data/ folder from "
+            f"{Path(__file__).resolve()}. Set KNOWLEDGEBASE_DIR."
+        )
+
+    def __init__(self, output_folder=None, jira_service_handler=None):
+        self.output_folder = Path(output_folder or self.default_knowledgebase_folder())
         self.output_folder.mkdir(parents=True, exist_ok=True)
 
         # rc.virginia.edu intermittently returns 403s to automated requests
@@ -132,20 +162,22 @@ class RCKBKnowledgeManager:
             browser={"browser": "chrome", "platform": "windows", "desktop": True}
         )
 
-        # Created on first use, so website-only runs don't need JIRA
-        # credentials or the Presidio models.
-        self._jira = None
+        # Created on first use, so website-only runs don't need the Flask app
+        # config or the Presidio models. A handler can also be passed in
+        # (e.g. the shared one from app, or a fake in tests).
+        self._jira_service = jira_service_handler
         self._analyzer = None
         self._anonymizer = None
 
     @property
-    def jira(self):
-        if self._jira is None:
-            self._jira = JIRA(
-                server=os.getenv("JIRA_SERVER"),
-                basic_auth=(os.getenv("JIRA_EMAIL"), os.getenv("JIRA_API_TOKEN")),
-            )
-        return self._jira
+    def jira_service(self):
+        if self._jira_service is None:
+            # Imported here rather than at module level: app imports the
+            # business modules, so a top-level import risks a circular import.
+            from app import app
+
+            self._jira_service = JiraServiceHandler(app)
+        return self._jira_service
 
     @property
     def analyzer(self):
@@ -183,14 +215,19 @@ class RCKBKnowledgeManager:
         if status in ("created", "updated"):
             stats["changed_files"].append(result["file"])
 
-    def _find_stale_files(self, prefix, expected_filenames):
+    def source_folder(self, source):
+        folder = self.output_folder / self.SOURCE_SUBFOLDERS[source]
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _find_stale_files(self, source, prefix, expected_filenames):
         # Documents left over from earlier runs whose source no longer exists
         # (page deleted, video removed from the playlist). Only listed, never
         # deleted: a source that is briefly unreachable would otherwise wipe
         # its documents.
         stale = sorted(
             path
-            for path in self.output_folder.glob(f"{prefix}*.md")
+            for path in self.source_folder(source).glob(f"{prefix}*.md")
             if path.name not in expected_filenames
         )
         if stale:
@@ -244,10 +281,10 @@ class RCKBKnowledgeManager:
         return filename[:maxLength]
 
     # Saving utility used by scrapers to generate update summaries
-    def save_document(self, filename, content):
+    def save_document(self, source, filename, content):
         if not filename.endswith(".md"):
             filename += ".md"
-        file_path = self.output_folder / filename
+        file_path = self.source_folder(source) / filename
 
         content = content.strip() + "\n"
 
@@ -313,7 +350,7 @@ class RCKBKnowledgeManager:
         )
 
     def _doc_path(self, url):
-        return self.output_folder / f"{self.generate_sanitized_filename(url)}.md"
+        return self.source_folder("website") / f"{self.generate_sanitized_filename(url)}.md"
 
     def _fetch(self, url, retries=3):
         # Retry requests that bot protection or rate limiting turned away
@@ -397,7 +434,7 @@ class RCKBKnowledgeManager:
                 print(f"Skipping {url} (no single article)")
                 stats["skipped"] += 1
             else:
-                result = self.save_document(self.generate_sanitized_filename(url), text)
+                result = self.save_document("website", self.generate_sanitized_filename(url), text)
                 self._record(stats, result)
                 print(f"Extracted ({result['status']}): {url}")
 
@@ -485,7 +522,7 @@ class RCKBKnowledgeManager:
                     stats["skipped"] += 1
                 else:
                     result = self.save_document(
-                        self.generate_sanitized_filename(url), text
+                        "website", self.generate_sanitized_filename(url), text
                     )
                     self._record(stats, result)
                     print(f"Added: {url}")
@@ -523,7 +560,7 @@ class RCKBKnowledgeManager:
                 print(f"Already has content: {url}")
                 continue
 
-            result = self.save_document(self.generate_sanitized_filename(url), text)
+            result = self.save_document("website", self.generate_sanitized_filename(url), text)
             self._record(stats, result)
             patched += 1
             print(f"Patched: {url}")
@@ -550,33 +587,34 @@ class RCKBKnowledgeManager:
         next_page_token = None
 
         while True:
-            batch = self.jira.enhanced_search_issues(
+            batch = self.jira_service.search_issues(
                 jql,
-                maxResults=100,
                 fields=["summary", "description", "comment"],
                 expand="renderedFields",
-                nextPageToken=next_page_token,
+                max_results=100,
+                next_page_token=next_page_token,
             )
-            issues.extend(batch)
+            issues.extend(batch.get("issues", []))
             print(f"Fetched {len(issues)} JIRA issues so far...")
 
-            next_page_token = getattr(batch, "nextPageToken", None)
-            if not next_page_token:
+            next_page_token = batch.get("nextPageToken")
+            if not next_page_token or batch.get("isLast"):
                 break
 
         return issues
 
+    # Issues are raw REST API dicts:
+    # {"key": ..., "fields": {...}, "renderedFields": {...}}
+
     # Description processing
     def _get_description(self, issue):
-        rendered_description = ""
-
-        if hasattr(issue, "renderedFields"):
-            rendered_description = (
-                getattr(issue.renderedFields, "description", "") or ""
-            )
+        rendered_fields = issue.get("renderedFields") or {}
+        rendered_description = rendered_fields.get("description") or ""
 
         if not rendered_description:
-            raw_description = issue.fields.description
+            # API v3 returns the raw description as an ADF dict, so this
+            # fallback only applies to plain-string descriptions
+            raw_description = (issue.get("fields") or {}).get("description")
             if isinstance(raw_description, str):
                 rendered_description = raw_description
 
@@ -601,28 +639,23 @@ class RCKBKnowledgeManager:
 
     # Comment processing
     def _extract_comments(self, issue):
-        raw_comments = []
-        if hasattr(issue.fields, "comment") and issue.fields.comment:
-            raw_comments = issue.fields.comment.comments
+        fields = issue.get("fields") or {}
+        raw_comments = (fields.get("comment") or {}).get("comments") or []
 
-        rendered_comments = []
-        if hasattr(issue, "renderedFields"):
-            rendered_comment_object = getattr(issue.renderedFields, "comment", None)
-            if rendered_comment_object:
-                rendered_comments = getattr(rendered_comment_object, "comments", [])
+        rendered_fields = issue.get("renderedFields") or {}
+        rendered_comments = (rendered_fields.get("comment") or {}).get("comments") or []
 
         comments = []
         for index, raw_comment in enumerate(raw_comments):
-            author = "Unknown"
-            if getattr(raw_comment, "author", None):
-                author = raw_comment.author.displayName
+            author = (raw_comment.get("author") or {}).get("displayName") or "Unknown"
 
             rendered_body = ""
             if index < len(rendered_comments):
-                rendered_body = getattr(rendered_comments[index], "body", "") or ""
+                rendered_body = rendered_comments[index].get("body") or ""
 
-            if not rendered_body and isinstance(raw_comment.body, str):
-                rendered_body = raw_comment.body
+            raw_body = raw_comment.get("body")
+            if not rendered_body and isinstance(raw_body, str):
+                rendered_body = raw_body
 
             body = self.strip_html_tags(rendered_body)
             if body:
@@ -667,9 +700,11 @@ class RCKBKnowledgeManager:
             for comment in self._extract_comments(issue)
         ]
 
+        summary = (issue.get("fields") or {}).get("summary") or ""
+
         return {
-            "key": issue.key,
-            "summary": self._scrub_text((issue.fields.summary or "").strip()),
+            "key": issue["key"],
+            "summary": self._scrub_text(summary.strip()),
             "description": self._scrub_text(description),
             "comments": processed_comments,
         }
@@ -715,6 +750,7 @@ class RCKBKnowledgeManager:
 
     def _save_jira_issue(self, issue):
         return self.save_document(
+            "jira",
             f"jira_{issue['key']}.md",
             self._build_jira_markdown(issue),
         )
@@ -744,7 +780,7 @@ class RCKBKnowledgeManager:
 
             except Exception as error:
                 stats["failed"] += 1
-                print(f"Failed to process {issue.key}: {error}")
+                print(f"Failed to process {issue.get('key', 'Unknown')}: {error}")
 
         return self.build_generation_result(**stats)
 
@@ -843,6 +879,7 @@ class RCKBKnowledgeManager:
 
     def _save_video(self, video):
         return self.save_document(
+            "videos",
             self._video_filename(video),
             self._build_video_markdown(video),
         )
@@ -876,6 +913,7 @@ class RCKBKnowledgeManager:
         # A partial run (max_videos) would flag every unvisited video
         if not max_videos:
             result["stale_files"] = self._find_stale_files(
+                "videos",
                 "youtube_",
                 {self._video_filename(entry) for entry in all_entries},
             )
@@ -887,8 +925,10 @@ class RCKBKnowledgeManager:
 
     @staticmethod
     def wiki_default_cookies_path():
-        project_root = Path(__file__).resolve().parents[2]
-        return project_root / "scrapers" / "auth_cookies.json"
+        # Kept outside the repo on purpose: these cookies are a live NetBadge
+        # session and must never be committed. Set WIKI_AUTH_COOKIES_PATH to
+        # put them somewhere else.
+        return Path.home() / ".config" / "uvarc-rag" / "netbadge_cookies.json"
 
     def _make_wiki_session(self, cookies_path=None):
         # Load the NetBadge cookies saved by netbadge_login()
@@ -1152,7 +1192,7 @@ class RCKBKnowledgeManager:
                     continue
 
                 result = self.save_document(
-                    self._wiki_filename(url), self._build_wiki_markdown(page)
+                    "wiki", self._wiki_filename(url), self._build_wiki_markdown(page)
                 )
                 self._record(stats, result)
                 print(f"    {result['status'].capitalize()}: {result['file'].name}")
@@ -1170,7 +1210,7 @@ class RCKBKnowledgeManager:
 
         # A partial run (max_pages) would flag every unvisited page
         if not max_pages:
-            result["stale_files"] = self._find_stale_files("wiki_", expected_filenames)
+            result["stale_files"] = self._find_stale_files("wiki", "wiki_", expected_filenames)
         return result
 
 

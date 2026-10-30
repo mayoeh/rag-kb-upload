@@ -1,207 +1,69 @@
-from pathlib import Path
-import time
+import logging
 
-from .business import (
-    UVARCJiraKnowledgeDataManager,
-    UVARCVideoKnowledgeDataManager,
-    UVARCWebsiteKnowledgeDataManager,
-    UVARCMarkdownKnowledgeDataManager,
-    UVARCKnowledgeBaseManager,
-)
+from .business import RCKBKnowledgeManager, WikiAuthenticationError
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-KNOWLEDGE_FOLDER = PROJECT_ROOT / "data"
-ALLOWED_EXTENSIONS = {".md", ".txt"}
+logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 5
-RETRY_DELAY = 2
-
-
-# Source Updates
-
-def update_jira_knowledge():
-    # Scrape JIRA and generate Markdown knowledge documents
-
-    print("Updating JIRA Knowledge")
-
-    jira_folder = KNOWLEDGE_FOLDER / "jira"
-
-    manager = UVARCJiraKnowledgeDataManager(
-        output_folder=jira_folder
-    )
-
-    result = manager.generate_knowledge_documents()
-
-    print()
-
-    return result
+# Source updates
 
 def update_website_knowledge():
+    logger.info("Updating RC website knowledge")
+    result = RCKBKnowledgeManager().generate_website_knowledge()
+    logger.info("Website knowledge update complete")
+    return result
 
-    print("Updating RC Website(s) Knowledge")
 
-    website_folder = KNOWLEDGE_FOLDER / "website"
+def update_jira_knowledge(full_refresh=False):
+    # Incremental by default: tickets updated in the last 2 days. Run with
+    # full_refresh=True once to build the full history.
+    logger.info("Updating JIRA knowledge (full_refresh=%s)", full_refresh)
+    result = RCKBKnowledgeManager().generate_jira_knowledge(full_refresh=full_refresh)
+    logger.info("JIRA knowledge update complete")
+    return result
 
-    manager = UVARCWebsiteKnowledgeDataManager(
-        output_folder=website_folder
-    )
-
-    manager.generate_knowledge_documents()
-
-    print()
-    print("Website Update Complete")
 
 def update_video_knowledge():
-    print("Updating Video Knowledge")
-
-    video_folder = KNOWLEDGE_FOLDER / "video"
-
-    manager = UVARCVideoKnowledgeDataManager(
-        output_folder=video_folder
-    )
-
-    result = manager.generate_knowledge_documents()
-
-    print()
-    print("Video Update Complete")
-
+    logger.info("Updating video knowledge")
+    result = RCKBKnowledgeManager().generate_video_knowledge()
+    logger.info("Video knowledge update complete")
     return result
 
-def update_markdown_knowledge():
-    print("Updating Markdown Knowledge")
 
-    markdown_folder = KNOWLEDGE_FOLDER / "markdown"
+def update_wiki_knowledge():
+    # Needs the NetBadge cookies saved by netbadge_login(). When they have
+    # expired, someone has to log in again and approve the Duo push, so this
+    # logs an error instead of retrying.
+    logger.info("Updating wiki knowledge")
+    try:
+        result = RCKBKnowledgeManager().generate_wiki_knowledge()
+    except WikiAuthenticationError as error:
+        logger.error("Wiki knowledge update skipped: %s", error)
+        return {"error": str(error)}
 
-    manager = UVARCMarkdownKnowledgeDataManager(
-        output_folder=markdown_folder
-    )
-
-    result = manager.generate_knowledge_documents()
-
-    print()
-    print("Markdown Update Complete")
-
+    logger.info("Wiki knowledge update complete")
     return result
 
-def update_all_sources():
-    # Regenerate local knowledge documents for every source.
 
-    print("Updating Knowledge Sources")
+def update_all_sources(full_jira_refresh=False):
+    # Runs every source in turn. A failing source is logged and recorded,
+    # and does not stop the others.
+    logger.info("Updating all knowledge sources")
+
+    updates = {
+        "website": update_website_knowledge,
+        "jira": lambda: update_jira_knowledge(full_refresh=full_jira_refresh),
+        "videos": update_video_knowledge,
+        "wiki": update_wiki_knowledge,
+    }
 
     results = {}
+    for source, update in updates.items():
+        try:
+            results[source] = update()
+        except Exception as error:
+            logger.exception("%s knowledge update failed", source)
+            results[source] = {"error": str(error)}
 
-    results["jira"] = update_jira_knowledge()
-    results["website"] = update_website_knowledge()
-    results["video"] = update_video_knowledge()
-    results["markdown"] = update_markdown_knowledge()
-
-    print()
-    print("Knowledge Source Update Complete")
-
+    logger.info("Knowledge source update complete")
     return results
-
-
-# Open WebUI Upload Tasks
-
-def add_file_with_retry(
-    manager,
-    file_id,
-    file_name,
-):
-
-
-    for attempt in range(
-        1,
-        MAX_RETRIES + 1,
-    ):
-        print(
-            f"  Attempt {attempt}/{MAX_RETRIES} "
-            f"to add {file_name} to Knowledge Base..."
-        )
-
-        if manager.add_file_to_knowledge_base(
-            file_id,
-            file_name,
-        ):
-            return True
-
-        if attempt < MAX_RETRIES:
-            print(
-                "  File may still be processing. "
-                f"Waiting {RETRY_DELAY} seconds..."
-            )
-
-            time.sleep(RETRY_DELAY)
-
-    print(
-        f"  Failed after {MAX_RETRIES} attempts."
-    )
-
-    return False
-
-
-def update_knowledge_base():
-    # Upload existing local knowledge documents to Open WebUI
-    # Does not access scrapers
-
-    print("Updating Open WebUI Knowledge Base")
-
-    print(f"Folder: {KNOWLEDGE_FOLDER}")
-    print()
-
-    if not KNOWLEDGE_FOLDER.exists():
-        print(
-            "ERROR: Knowledge folder does not exist."
-        )
-        return
-
-    files = [
-        file
-        for file in KNOWLEDGE_FOLDER.rglob("*")
-        if (
-            file.is_file()
-            and file.suffix.lower()
-            in ALLOWED_EXTENSIONS
-        )
-    ]
-
-    print(f"Found {len(files)} files.")
-    print()
-
-    if not files:
-        print(
-            "No .md or .txt files found."
-        )
-        return
-
-    manager = UVARCKnowledgeBaseManager()
-
-    successful = 0
-    failed = 0
-
-    for file_path in files:
-        file_id = manager.upload_file(
-            file_path
-        )
-
-        if file_id:
-            if add_file_with_retry(
-                manager,
-                file_id,
-                file_path.name,
-            ):
-                successful += 1
-            else:
-                failed += 1
-
-        else:
-            failed += 1
-
-        print()
-
-    print("Upload Complete")
-
-    print(f"Total files: {len(files)}")
-    print(f"Successful:  {successful}")
-    print(f"Failed:      {failed}")

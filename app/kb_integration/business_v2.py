@@ -1,5 +1,4 @@
 import json
-import os
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -10,7 +9,6 @@ from urllib.parse import unquote, urljoin, urlparse
 import cloudscraper
 import requests
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
 from youtube_transcript_api import (
@@ -19,10 +17,6 @@ from youtube_transcript_api import (
     YouTubeTranscriptApi,
 )
 from yt_dlp import YoutubeDL
-
-from common_service_handlers.jira_service_handler import JiraServiceHandler
-
-load_dotenv()
 
 
 class WikiAuthenticationError(RuntimeError):
@@ -133,14 +127,8 @@ class RCKBKnowledgeManager:
     }
 
     @staticmethod
-    def default_knowledgebase_folder():
-        # <repo>/data/knowledgebase. Set KNOWLEDGEBASE_DIR to override.
-        # The repo root is found by walking up from this file to the first
-        # folder that holds both app/ and data/, so it keeps working however
-        # deep the RAG app folder ends up.
-        override = os.getenv("KNOWLEDGEBASE_DIR")
-        if override:
-            return Path(override)
+    def __default_knowledgebase_folder():
+        # <repo>/data/knowledgebase
 
         for parent in Path(__file__).resolve().parents:
             if (parent / "app").is_dir() and (parent / "data").is_dir():
@@ -152,7 +140,7 @@ class RCKBKnowledgeManager:
         )
 
     def __init__(self, output_folder=None, jira_service_handler=None):
-        self.output_folder = Path(output_folder or self.default_knowledgebase_folder())
+        self.output_folder = Path(output_folder or self.__default_knowledgebase_folder())
         self.output_folder.mkdir(parents=True, exist_ok=True)
 
         # rc.virginia.edu intermittently returns 403s to automated requests
@@ -170,23 +158,21 @@ class RCKBKnowledgeManager:
         self._anonymizer = None
 
     @property
-    def jira_service(self):
+    def __jira_service(self):
         if self._jira_service is None:
-            # Imported here rather than at module level: app imports the
-            # business modules, so a top-level import risks a circular import.
-            from app import app
+            from app import jira_service
 
-            self._jira_service = JiraServiceHandler(app)
+            self._jira_service = jira_service
         return self._jira_service
 
     @property
-    def analyzer(self):
+    def __analyzer(self):
         if self._analyzer is None:
             self._analyzer = AnalyzerEngine()
         return self._analyzer
 
     @property
-    def anonymizer(self):
+    def __anonymizer(self):
         if self._anonymizer is None:
             self._anonymizer = AnonymizerEngine()
         return self._anonymizer
@@ -196,7 +182,7 @@ class RCKBKnowledgeManager:
     ############################
 
     @staticmethod
-    def _new_stats():
+    def __new_stats():
         return {
             "fetched": 0,
             "created": 0,
@@ -208,35 +194,35 @@ class RCKBKnowledgeManager:
         }
 
     @staticmethod
-    def _record(stats, result):
+    def __record(stats, result):
         # Tally a save_document() result into a stats dict
         status = result["status"]
         stats[status] += 1
         if status in ("created", "updated"):
             stats["changed_files"].append(result["file"])
 
-    def source_folder(self, source):
+    def __source_folder(self, source):
         folder = self.output_folder / self.SOURCE_SUBFOLDERS[source]
         folder.mkdir(parents=True, exist_ok=True)
         return folder
 
-    def _find_stale_files(self, source, prefix, expected_filenames):
+    def __find_stale_files(self, source, prefix, expected_filenames):
         # Documents left over from earlier runs whose source no longer exists
         # (page deleted, video removed from the playlist). Only listed, never
         # deleted: a source that is briefly unreachable would otherwise wipe
         # its documents.
         stale = sorted(
             path
-            for path in self.source_folder(source).glob(f"{prefix}*.md")
+            for path in self.__source_folder(source).glob(f"{prefix}*.md")
             if path.name not in expected_filenames
         )
         if stale:
             print(f"Stale files (source no longer lists them): {len(stale)}")
             for path in stale:
                 print(f"  {path.name}")
-        return stale
+        return [str(path) for path in stale]
 
-    def build_generation_result(
+    def __build_generation_result(
         self,
         fetched,
         created,
@@ -245,6 +231,8 @@ class RCKBKnowledgeManager:
         skipped,
         failed,
         changed_files,
+        source=None,
+        started=None,
     ):
         print("KNOWLEDGE GENERATION COMPLETE")
         print(f"Fetched:   {fetched}")
@@ -253,6 +241,9 @@ class RCKBKnowledgeManager:
         print(f"Unchanged: {unchanged}")
         print(f"Skipped:   {skipped}")
         print(f"Failed:    {failed}")
+        if started is not None:
+            elapsed = self.__format_duration(time.monotonic() - started)
+            print(f"{source} knowledge generation took {elapsed}")
 
         return {
             "fetched": fetched,
@@ -261,11 +252,11 @@ class RCKBKnowledgeManager:
             "unchanged": unchanged,
             "skipped": skipped,
             "failed": failed,
-            "changed_files": changed_files,
+            "changed_files": [str(path) for path in changed_files],
         }
 
     # Given the title of a source, transform it to a usable, safe filename
-    def generate_sanitized_filename(self, name, maxLength=200, hasSpaces=False):
+    def __generate_sanitized_filename(self, name, maxLength=200, hasSpaces=False):
         if not name:
             return ""
 
@@ -281,10 +272,10 @@ class RCKBKnowledgeManager:
         return filename[:maxLength]
 
     # Saving utility used by scrapers to generate update summaries
-    def save_document(self, source, filename, content):
+    def __save_document(self, source, filename, content):
         if not filename.endswith(".md"):
             filename += ".md"
-        file_path = self.source_folder(source) / filename
+        file_path = self.__source_folder(source) / filename
 
         content = content.strip() + "\n"
 
@@ -302,7 +293,7 @@ class RCKBKnowledgeManager:
         return {"status": "updated", "file": file_path}
 
     # Cleaning text using common regex patterns and removing whitespace
-    def clean_markdown_text(self, text):
+    def __clean_markdown_text(self, text):
         if not text:
             return ""
 
@@ -314,7 +305,7 @@ class RCKBKnowledgeManager:
         text = re.sub(r"[ \t]+", " ", text)
         return text.strip() + "\n"
 
-    def strip_html_tags(self, html):
+    def __strip_html_tags(self, html):
         if not html:
             return ""
         text = re.sub(r"<br\s*/?>", "\n", html)
@@ -322,7 +313,7 @@ class RCKBKnowledgeManager:
         text = re.sub(r"</li>", "\n", text)
         text = re.sub(r"<[^>]+>", "", text)
         text = unescape(text)
-        return self.clean_markdown_text(text)
+        return self.__clean_markdown_text(text)
 
     ############################
     #       WEBSITE LOGIC      #
@@ -330,18 +321,19 @@ class RCKBKnowledgeManager:
 
     def generate_website_knowledge(self):
         print("Starting website knowledge generation...")
-        stats = self._new_stats()
+        started = time.monotonic()
+        stats = self.__new_stats()
         visited = set()
 
         for seed in self.WEBSITE_SEEDS:
-            self._crawl(seed, visited, stats)
+            self.__crawl(seed, visited, stats)
 
-        self.fill_sitemap_gaps(stats)
-        self.patch_js_rendered_pages(stats)
+        self.__fill_sitemap_gaps(stats)
+        self.__patch_js_rendered_pages(stats)
 
-        return self.build_generation_result(**stats)
+        return self.__build_generation_result(**stats, source="Website", started=started)
 
-    def _is_valid(self, url):
+    def __is_valid(self, url):
         parsed = urlparse(url)
         return (
             parsed.scheme in {"http", "https"}
@@ -349,10 +341,10 @@ class RCKBKnowledgeManager:
             and not parsed.path.lower().endswith(self.SKIP_EXTENSIONS)
         )
 
-    def _doc_path(self, url):
-        return self.source_folder("website") / f"{self.generate_sanitized_filename(url)}.md"
+    def __doc_path(self, url):
+        return self.__source_folder("website") / f"{self.__generate_sanitized_filename(url)}.md"
 
-    def _fetch(self, url, retries=3):
+    def __fetch(self, url, retries=3):
         # Retry requests that bot protection or rate limiting turned away
         for attempt in range(retries):
             response = self.scraper.get(url, timeout=15)
@@ -363,7 +355,7 @@ class RCKBKnowledgeManager:
             time.sleep(wait)
         return response
 
-    def _parse_article(self, soup, url):
+    def __parse_article(self, soup, url):
         # Returns cleaned Markdown for the page's single <article>, or None
         articles = soup.find_all("article")
         if len(articles) != 1:
@@ -396,18 +388,18 @@ class RCKBKnowledgeManager:
         for h1_tag in article.find_all("h1"):
             h1_tag.string = f"\n\n## {h1_tag.get_text(strip=True)}\n"
 
-        return self.clean_markdown_text(article.get_text())
+        return self.__clean_markdown_text(article.get_text())
 
-    def _crawl(self, url, visited, stats=None):
+    def __crawl(self, url, visited, stats=None):
         if stats is None:
-            stats = self._new_stats()
+            stats = self.__new_stats()
 
         if url in visited:
             return stats
         visited.add(url)
 
         try:
-            response = self._fetch(url)
+            response = self.__fetch(url)
 
             if response.url != url:
                 url = response.url
@@ -429,20 +421,20 @@ class RCKBKnowledgeManager:
             stats["fetched"] += 1
             soup = BeautifulSoup(response.text, "html.parser")
 
-            text = self._parse_article(soup, url)
+            text = self.__parse_article(soup, url)
             if text is None:
                 print(f"Skipping {url} (no single article)")
                 stats["skipped"] += 1
             else:
-                result = self.save_document("website", self.generate_sanitized_filename(url), text)
-                self._record(stats, result)
+                result = self.__save_document("website", self.__generate_sanitized_filename(url), text)
+                self.__record(stats, result)
                 print(f"Extracted ({result['status']}): {url}")
 
             # Follow links from the whole page, not just the article
             for a_tag in soup.find_all("a", href=True):
                 next_url = urljoin(url, a_tag["href"]).split("#")[0]
-                if next_url not in visited and self._is_valid(next_url):
-                    self._crawl(next_url, visited, stats)
+                if next_url not in visited and self.__is_valid(next_url):
+                    self.__crawl(next_url, visited, stats)
 
             time.sleep(self.REQUEST_DELAY)
 
@@ -452,12 +444,12 @@ class RCKBKnowledgeManager:
 
         return stats
 
-    def _get_sitemap_urls(self, sitemap_url, skip_patterns=None):
+    def __get_sitemap_urls(self, sitemap_url, skip_patterns=None):
         skip_patterns = skip_patterns or []
         ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
         print(f"Fetching sitemap: {sitemap_url}")
-        resp = self._fetch(sitemap_url)
+        resp = self.__fetch(sitemap_url)
         if resp.status_code != 200:
             print(f"  Could not fetch sitemap (status {resp.status_code})")
             return []
@@ -482,18 +474,18 @@ class RCKBKnowledgeManager:
         print(f"  Found {len(urls)} URLs")
         return urls
 
-    def fill_sitemap_gaps(self, stats=None):
+    def __fill_sitemap_gaps(self, stats=None):
         # Catch orphan pages the link crawl never reached
         if stats is None:
-            stats = self._new_stats()
+            stats = self.__new_stats()
 
-        all_sitemap_urls = self._get_sitemap_urls(
+        all_sitemap_urls = self.__get_sitemap_urls(
             self.RC_SITEMAP
-        ) + self._get_sitemap_urls(self.LEARNING_SITEMAP, self.SKIP_PATTERNS)
+        ) + self.__get_sitemap_urls(self.LEARNING_SITEMAP, self.SKIP_PATTERNS)
 
         missing = []
         for url in all_sitemap_urls:
-            path = self._doc_path(url)
+            path = self.__doc_path(url)
             if not path.exists() or path.stat().st_size == 0:
                 missing.append(url)
 
@@ -505,7 +497,7 @@ class RCKBKnowledgeManager:
 
         for url in missing:
             try:
-                response = self._fetch(url)
+                response = self.__fetch(url)
                 if response.status_code != 200 or "text/html" not in response.headers.get(
                     "Content-Type", ""
                 ):
@@ -515,16 +507,16 @@ class RCKBKnowledgeManager:
 
                 stats["fetched"] += 1
                 soup = BeautifulSoup(response.text, "html.parser")
-                text = self._parse_article(soup, url)
+                text = self.__parse_article(soup, url)
 
                 if text is None:
                     print(f"Skipped (no article): {url}")
                     stats["skipped"] += 1
                 else:
-                    result = self.save_document(
-                        "website", self.generate_sanitized_filename(url), text
+                    result = self.__save_document(
+                        "website", self.__generate_sanitized_filename(url), text
                     )
-                    self._record(stats, result)
+                    self.__record(stats, result)
                     print(f"Added: {url}")
 
                 time.sleep(self.REQUEST_DELAY)
@@ -536,11 +528,11 @@ class RCKBKnowledgeManager:
         print("Finished filling sitemap gaps.")
         return stats
 
-    def patch_js_rendered_pages(self, stats=None):
+    def __patch_js_rendered_pages(self, stats=None):
         # Pages whose content is rendered by JavaScript, so the crawler
         # can't see it. Text is maintained by hand here.
         if stats is None:
-            stats = self._new_stats()
+            stats = self.__new_stats()
 
         manual_patches = {
             "https://rc.virginia.edu/userinfo/hpc/slurm-script-generator/": (
@@ -555,13 +547,13 @@ class RCKBKnowledgeManager:
 
         patched = 0
         for url, text in manual_patches.items():
-            path = self._doc_path(url)
+            path = self.__doc_path(url)
             if path.exists() and path.stat().st_size >= 100:
                 print(f"Already has content: {url}")
                 continue
 
-            result = self.save_document("website", self.generate_sanitized_filename(url), text)
-            self._record(stats, result)
+            result = self.__save_document("website", self.__generate_sanitized_filename(url), text)
+            self.__record(stats, result)
             patched += 1
             print(f"Patched: {url}")
 
@@ -572,22 +564,22 @@ class RCKBKnowledgeManager:
     #        JIRA LOGIC        #
     ############################
 
-    def get_all_jira_issues(self):
+    def __get_all_jira_issues(self):
         # Initial population of the KB or full rebuild
         jql = self.JIRA_BASE_FILTER + "ORDER BY updated DESC"
-        return self._fetch_issues(jql)
+        return self.__fetch_issues(jql)
 
-    def get_recent_jira_issues(self):
+    def __get_recent_jira_issues(self):
         # Incremental scrape for recently updated issues
         jql = self.JIRA_BASE_FILTER + "AND updated >= -2d ORDER BY updated DESC"
-        return self._fetch_issues(jql)
+        return self.__fetch_issues(jql)
 
-    def _fetch_issues(self, jql):
+    def __fetch_issues(self, jql):
         issues = []
         next_page_token = None
 
         while True:
-            batch = self.jira_service.search_issues(
+            batch = self.__jira_service.search_issues(
                 jql,
                 fields=["summary", "description", "comment"],
                 expand="renderedFields",
@@ -607,7 +599,7 @@ class RCKBKnowledgeManager:
     # {"key": ..., "fields": {...}, "renderedFields": {...}}
 
     # Description processing
-    def _get_description(self, issue):
+    def __get_description(self, issue):
         rendered_fields = issue.get("renderedFields") or {}
         rendered_description = rendered_fields.get("description") or ""
 
@@ -618,9 +610,9 @@ class RCKBKnowledgeManager:
             if isinstance(raw_description, str):
                 rendered_description = raw_description
 
-        return self.strip_html_tags(rendered_description)
+        return self.__strip_html_tags(rendered_description)
 
-    def _classify_description(self, description):
+    def __classify_description(self, description):
         if "Description:" in description:
             return "form_with_description"
 
@@ -629,7 +621,7 @@ class RCKBKnowledgeManager:
 
         return "free_text"
 
-    def _extract_form_description(self, description):
+    def __extract_form_description(self, description):
         content = description.split("Description:", 1)[1]
 
         if "Classification:" in content:
@@ -638,7 +630,7 @@ class RCKBKnowledgeManager:
         return content.strip()
 
     # Comment processing
-    def _extract_comments(self, issue):
+    def __extract_comments(self, issue):
         fields = issue.get("fields") or {}
         raw_comments = (fields.get("comment") or {}).get("comments") or []
 
@@ -657,62 +649,62 @@ class RCKBKnowledgeManager:
             if not rendered_body and isinstance(raw_body, str):
                 rendered_body = raw_body
 
-            body = self.strip_html_tags(rendered_body)
+            body = self.__strip_html_tags(rendered_body)
             if body:
                 comments.append({"author": author, "body": body})
 
         return comments
 
     # PII scrubbing
-    def _scrub_text(self, text):
+    def __scrub_text(self, text):
         if not text:
             return text
 
-        results = self.analyzer.analyze(
+        results = self.__analyzer.analyze(
             text=text,
             language="en",
             entities=["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER"],
         )
-        text = self.anonymizer.anonymize(text=text, analyzer_results=results).text
+        text = self.__anonymizer.anonymize(text=text, analyzer_results=results).text
 
         return self.UVA_ID_RE.sub("<UVA_ID>", text)
 
     # Issue processing
-    def _process_issue(self, issue):
-        description = self._get_description(issue)
+    def __process_issue(self, issue):
+        description = self.__get_description(issue)
         if not description:
             return None
 
-        ticket_type = self._classify_description(description)
+        ticket_type = self.__classify_description(description)
         if ticket_type == "form_metadata":
             return None
 
         if ticket_type == "form_with_description":
-            description = self._extract_form_description(description)
+            description = self.__extract_form_description(description)
             if not description:
                 return None
 
         processed_comments = [
             {
-                "author": self._scrub_text(comment["author"]),
-                "body": self._scrub_text(comment["body"]),
+                "author": self.__scrub_text(comment["author"]),
+                "body": self.__scrub_text(comment["body"]),
             }
-            for comment in self._extract_comments(issue)
+            for comment in self.__extract_comments(issue)
         ]
 
         summary = (issue.get("fields") or {}).get("summary") or ""
 
         return {
             "key": issue["key"],
-            "summary": self._scrub_text(summary.strip()),
-            "description": self._scrub_text(description),
+            "summary": self.__scrub_text(summary.strip()),
+            "description": self.__scrub_text(description),
             "comments": processed_comments,
         }
 
     # Markdown generation
-    def _build_jira_markdown(self, issue):
-        summary = self.clean_markdown_text(issue["summary"]).strip()
-        description = self.clean_markdown_text(issue["description"]).strip()
+    def __build_jira_markdown(self, issue):
+        summary = self.__clean_markdown_text(issue["summary"]).strip()
+        description = self.__clean_markdown_text(issue["description"]).strip()
 
         markdown = f"""# {summary}
 
@@ -734,7 +726,7 @@ class RCKBKnowledgeManager:
 
             comment_number = 1
             for comment in issue["comments"]:
-                body = self.clean_markdown_text(comment["body"]).strip()
+                body = self.__clean_markdown_text(comment["body"]).strip()
                 if not body:
                     continue
 
@@ -748,47 +740,48 @@ class RCKBKnowledgeManager:
 
         return markdown.strip() + "\n"
 
-    def _save_jira_issue(self, issue):
-        return self.save_document(
+    def __save_jira_issue(self, issue):
+        return self.__save_document(
             "jira",
             f"jira_{issue['key']}.md",
-            self._build_jira_markdown(issue),
+            self.__build_jira_markdown(issue),
         )
 
     # JIRA generation
-    def generate_jira_knowledge(self, full_refresh=False):
+    def generate_jira_knowledge(self, full_refresh=True):
+        started = time.monotonic()
         if full_refresh:
             print("Starting FULL JIRA knowledge generation...")
-            issues = self.get_all_jira_issues()
+            issues = self.__get_all_jira_issues()
         else:
             print("Starting incremental JIRA knowledge generation...")
-            issues = self.get_recent_jira_issues()
+            issues = self.__get_recent_jira_issues()
 
-        stats = self._new_stats()
+        stats = self.__new_stats()
         stats["fetched"] = len(issues)
 
         for issue in issues:
             try:
-                processed_issue = self._process_issue(issue)
+                processed_issue = self.__process_issue(issue)
                 if processed_issue is None:
                     stats["skipped"] += 1
                     continue
 
-                result = self._save_jira_issue(processed_issue)
-                self._record(stats, result)
+                result = self.__save_jira_issue(processed_issue)
+                self.__record(stats, result)
                 print(f"{result['status'].capitalize()}: {result['file'].name}")
 
             except Exception as error:
                 stats["failed"] += 1
                 print(f"Failed to process {issue.get('key', 'Unknown')}: {error}")
 
-        return self.build_generation_result(**stats)
+        return self.__build_generation_result(**stats, source="JIRA", started=started)
 
     ############################
     #       VIDEO LOGIC        #
     ############################
 
-    def _fetch_playlist(self):
+    def __fetch_playlist(self):
         ydl_options = {
             "extract_flat": True,
             "quiet": True,
@@ -800,7 +793,7 @@ class RCKBKnowledgeManager:
         print(f"Found {len(entries)} videos in: {info.get('title', 'Unknown')}")
         return entries
 
-    def _get_video_metadata(self, video_url):
+    def __get_video_metadata(self, video_url):
         ydl_options = {
             "quiet": True,
             "skip_download": True,
@@ -817,7 +810,7 @@ class RCKBKnowledgeManager:
             "webpage_url": info.get("webpage_url", video_url),
         }
 
-    def _get_transcript(self, video_id):
+    def __get_transcript(self, video_id):
         # A video without English captions is still worth keeping for its
         # title and description. Rate limits (IpBlocked/RequestBlocked) are
         # not caught here, so they still count as failures.
@@ -832,24 +825,24 @@ class RCKBKnowledgeManager:
         )
 
     @staticmethod
-    def _video_id(entry):
+    def __video_id(entry):
         # Works for playlist entries and for _process_video() results
         return entry.get("id") or entry["url"].split("v=")[-1]
 
-    def _video_filename(self, entry):
-        return f"youtube_{self._video_id(entry)}.md"
+    def __video_filename(self, entry):
+        return f"youtube_{self.__video_id(entry)}.md"
 
-    def _process_video(self, entry):
+    def __process_video(self, entry):
         video_url = entry["url"]
-        video_id = self._video_id(entry)
+        video_id = self.__video_id(entry)
 
         return {
             "id": video_id,
-            "metadata": self._get_video_metadata(video_url),
-            "transcript": self._get_transcript(video_id),
+            "metadata": self.__get_video_metadata(video_url),
+            "transcript": self.__get_transcript(video_id),
         }
 
-    def _build_video_markdown(self, video):
+    def __build_video_markdown(self, video):
         metadata = video["metadata"]
 
         return f"""# {metadata["title"]}
@@ -877,29 +870,30 @@ class RCKBKnowledgeManager:
 {video["transcript"]}
 """.strip() + "\n"
 
-    def _save_video(self, video):
-        return self.save_document(
+    def __save_video(self, video):
+        return self.__save_document(
             "videos",
-            self._video_filename(video),
-            self._build_video_markdown(video),
+            self.__video_filename(video),
+            self.__build_video_markdown(video),
         )
 
     # Video generation
     def generate_video_knowledge(self, max_videos=None):
         print("Starting video knowledge generation...")
-        entries = self._fetch_playlist()
+        started = time.monotonic()
+        entries = self.__fetch_playlist()
         all_entries = entries
         if max_videos:
             entries = entries[:max_videos]
 
-        stats = self._new_stats()
+        stats = self.__new_stats()
         stats["fetched"] = len(entries)
 
         for entry in entries:
             try:
-                video = self._process_video(entry)
-                result = self._save_video(video)
-                self._record(stats, result)
+                video = self.__process_video(entry)
+                result = self.__save_video(video)
+                self.__record(stats, result)
                 print(f"{result['status'].capitalize()}: {result['file'].name}")
 
             except Exception as error:
@@ -908,14 +902,14 @@ class RCKBKnowledgeManager:
 
             time.sleep(self.VIDEO_REQUEST_DELAY)
 
-        result = self.build_generation_result(**stats)
+        result = self.__build_generation_result(**stats, source="Video", started=started)
 
         # A partial run (max_videos) would flag every unvisited video
         if not max_videos:
-            result["stale_files"] = self._find_stale_files(
+            result["stale_files"] = self.__find_stale_files(
                 "videos",
                 "youtube_",
-                {self._video_filename(entry) for entry in all_entries},
+                {self.__video_filename(entry) for entry in all_entries},
             )
         return result
 
@@ -923,19 +917,16 @@ class RCKBKnowledgeManager:
     #        WIKI LOGIC        #
     ############################
 
-    @staticmethod
-    def wiki_default_cookies_path():
-        # Kept outside the repo on purpose: these cookies are a live NetBadge
-        # session and must never be committed. Set WIKI_AUTH_COOKIES_PATH to
-        # put them somewhere else.
-        return Path.home() / ".config" / "uvarc-rag" / "netbadge_cookies.json"
+    # Kept outside the repo on purpose: these cookies are a live NetBadge
+    # session and must never be committed. Set WIKI_AUTH_COOKIES_PATH to
+    # put them somewhere else.
+    WIKI_DEFAULT_COOKIES_PATH = Path.home() / ".config" / "uvarc-rag" / "netbadge_cookies.json"
 
-    def _make_wiki_session(self, cookies_path=None):
+    def __make_wiki_session(self, cookies_path=None):
         # Load the NetBadge cookies saved by netbadge_login()
         cookies_path = Path(
             cookies_path
-            or os.getenv("WIKI_AUTH_COOKIES_PATH")
-            or self.wiki_default_cookies_path()
+            or self.WIKI_DEFAULT_COOKIES_PATH
         )
         if not cookies_path.exists():
             raise WikiAuthenticationError(
@@ -955,7 +946,7 @@ class RCKBKnowledgeManager:
         )
         return session
 
-    def _check_wiki_session(self, response):
+    def __check_wiki_session(self, response):
         # A NetBadge page returned with HTTP 200 means the cookies died
         # mid-run. Fail loudly instead of saving login pages as documents.
         if "NetBadge" in response.text or "shibidp" in response.url:
@@ -963,7 +954,7 @@ class RCKBKnowledgeManager:
                 "NetBadge redirect — cookies expired. Re-run netbadge_login()."
             )
 
-    def _should_skip_wiki_url(self, url):
+    def __should_skip_wiki_url(self, url):
         parsed = urlparse(url)
 
         # "?printable" and "?revision=" map to the same filename as the plain
@@ -976,13 +967,13 @@ class RCKBKnowledgeManager:
 
         return any(segment in parsed.path for segment in self.WIKI_SKIP_PATH_SEGMENTS)
 
-    def _wiki_page_title(self, url):
+    def __wiki_page_title(self, url):
         path = urlparse(url).path
         if path.startswith("/wiki/"):
             return unquote(path[len("/wiki/"):])
         return url
 
-    def _get_wiki_page_urls(self, session):
+    def __get_wiki_page_urls(self, session):
         # _index only lists the top level. Subdirectories show up as
         # <li class="folder"> links (e.g. /wiki/Guides/) whose own listing has
         # to be expanded in turn. The front page is not listed anywhere.
@@ -993,7 +984,7 @@ class RCKBKnowledgeManager:
         while folders:
             folder_url = folders.pop(0)
             response = session.get(folder_url, timeout=20)
-            self._check_wiki_session(response)
+            self.__check_wiki_session(response)
 
             soup = BeautifulSoup(response.text, "html.parser")
             entries = soup.select("li.page, li.folder")
@@ -1007,7 +998,7 @@ class RCKBKnowledgeManager:
                     continue
 
                 url = urljoin(folder_url, a_tag["href"]).split("#")[0]
-                if "/wiki/" not in url or self._should_skip_wiki_url(url):
+                if "/wiki/" not in url or self.__should_skip_wiki_url(url):
                     continue
 
                 if "folder" in entry.get("class", []):
@@ -1022,48 +1013,48 @@ class RCKBKnowledgeManager:
         print(f"Expanded {len(seen_folders) - 1} folders")
         return list(dict.fromkeys(urls))
 
-    def _get_wiki_soup(self, session, url):
+    def __get_wiki_soup(self, session, url):
         response = session.get(url, timeout=20)
         if response.status_code != 200:
             return None
 
-        self._check_wiki_session(response)
+        self.__check_wiki_session(response)
 
         if "text/html" not in response.headers.get("Content-Type", ""):
             return None
         return BeautifulSoup(response.text, "html.parser")
 
-    def _fetch_wiki_page(self, session, url):
+    def __fetch_wiki_page(self, session, url):
         # Returns (url, soup). Gitit's listing drops a leading space from page
         # names, so "HPC Support/ SLURM" is listed as ".../SLURM" and 404s.
         # Retry with the space put back.
-        soup = self._get_wiki_soup(session, url)
+        soup = self.__get_wiki_soup(session, url)
         if soup is not None:
             return url, soup
 
         head, _, name = url.rpartition("/")
         spaced_url = f"{head}/%20{name}"
-        soup = self._get_wiki_soup(session, spaced_url)
+        soup = self.__get_wiki_soup(session, spaced_url)
         if soup is not None:
             return spaced_url, soup
 
         return url, None
 
-    def _scrub_wiki_text(self, text):
+    def __scrub_wiki_text(self, text):
         # Wiki pages are full of module names (gcc9, cuda11) that UVA_ID_RE
         # matches, and Presidio reads command and host names as PERSON, so
         # only emails and phone numbers are scrubbed here
         if not text:
             return text
 
-        results = self.analyzer.analyze(
+        results = self.__analyzer.analyze(
             text=text,
             language="en",
             entities=["EMAIL_ADDRESS", "PHONE_NUMBER"],
         )
-        return self.anonymizer.anonymize(text=text, analyzer_results=results).text
+        return self.__anonymizer.anonymize(text=text, analyzer_results=results).text
 
-    def _wiki_soup_to_text(self, node):
+    def __wiki_soup_to_text(self, node):
         # get_text(separator="\n") would put every inline tag on its own line,
         # so mark the block boundaries first and then join with nothing
         for tag in node.find_all(self.WIKI_BLOCK_TAGS):
@@ -1076,7 +1067,7 @@ class RCKBKnowledgeManager:
 
         return node.get_text()
 
-    def _parse_wiki_page(self, url, soup, scrub_pii=True):
+    def __parse_wiki_page(self, url, soup, scrub_pii=True):
         # Returns {"title", "text", "source", "tags"} for one Gitit page, or None
         wikipage = soup.find(id="wikipage")
         if not wikipage:
@@ -1091,7 +1082,7 @@ class RCKBKnowledgeManager:
         # Take the title from the <h1> and drop it; _build_wiki_markdown adds
         # the heading back
         title_tag = wikipage.find("h1")
-        title = title_tag.get_text(strip=True) if title_tag else self._wiki_page_title(url)
+        title = title_tag.get_text(strip=True) if title_tag else self.__wiki_page_title(url)
         if title_tag:
             title_tag.decompose()
 
@@ -1104,11 +1095,11 @@ class RCKBKnowledgeManager:
             if link_text:
                 a_tag.string = f"[{link_text}]({href})"
 
-        text = self._wiki_soup_to_text(wikipage)
+        text = self.__wiki_soup_to_text(wikipage)
 
         # clean_markdown_text only drops .png references
         text = re.sub(r"\S+\.(?:jpg|jpeg|gif|svg|webp)", "", text)
-        text = self.clean_markdown_text(text).strip()
+        text = self.__clean_markdown_text(text).strip()
         if not text:
             return None
 
@@ -1120,8 +1111,8 @@ class RCKBKnowledgeManager:
         )
 
         if scrub_pii:
-            title = self._scrub_wiki_text(title)
-            text = self._scrub_wiki_text(text)
+            title = self.__scrub_wiki_text(title)
+            text = self.__scrub_wiki_text(text)
 
         return {
             "title": title,
@@ -1130,7 +1121,7 @@ class RCKBKnowledgeManager:
             "tags": ["wiki"] + categories,
         }
 
-    def _build_wiki_markdown(self, page):
+    def __build_wiki_markdown(self, page):
         title = page["title"] or "Wiki Page"
         text = page["text"]
         body = text if text.startswith("#") else f"# {title}\n\n{text}"
@@ -1146,13 +1137,13 @@ class RCKBKnowledgeManager:
 **Tags:** {", ".join(page["tags"])}
 """
 
-    def _wiki_filename(self, url):
+    def __wiki_filename(self, url):
         # Named from the URL path, not the title: two pages can share an <h1>.
         # Each segment is stripped so "HPC Support/ SLURM" does not become a
         # double underscore.
-        title = "/".join(part.strip() for part in self._wiki_page_title(url).split("/"))
+        title = "/".join(part.strip() for part in self.__wiki_page_title(url).split("/"))
         slug = re.sub(r"\s+", "_", title)
-        slug = self.generate_sanitized_filename(slug, 150, True).strip("_")
+        slug = self.__generate_sanitized_filename(slug, 150, True).strip("_")
         return f"wiki_{slug or 'index'}.md"
 
     # Wiki generation
@@ -1161,40 +1152,41 @@ class RCKBKnowledgeManager:
         # (Duo push), so WikiAuthenticationError aborts the run instead of
         # being counted as a failed page.
         print("Starting wiki knowledge generation...")
-        session = self._make_wiki_session(cookies_path)
+        started = time.monotonic()
+        session = self.__make_wiki_session(cookies_path)
 
         response = session.get(self.WIKI_BASE_URL, timeout=20)
-        self._check_wiki_session(response)
+        self.__check_wiki_session(response)
 
-        page_urls = self._get_wiki_page_urls(session)
+        page_urls = self.__get_wiki_page_urls(session)
         print(f"Found {len(page_urls)} wiki pages")
         # Leading-space pages map to the same filename as their listed URL
-        expected_filenames = {self._wiki_filename(url) for url in page_urls}
+        expected_filenames = {self.__wiki_filename(url) for url in page_urls}
         if max_pages:
             page_urls = page_urls[:max_pages]
 
-        stats = self._new_stats()
+        stats = self.__new_stats()
         stats["fetched"] = len(page_urls)
 
         for index, url in enumerate(page_urls, 1):
-            print(f"  [{index}/{len(page_urls)}] {self._wiki_page_title(url) or '(front page)'}")
+            print(f"  [{index}/{len(page_urls)}] {self.__wiki_page_title(url) or '(front page)'}")
             try:
-                url, soup = self._fetch_wiki_page(session, url)
+                url, soup = self.__fetch_wiki_page(session, url)
                 if soup is None:
                     print("    Skipped (page not found)")
                     stats["skipped"] += 1
                     continue
 
-                page = self._parse_wiki_page(url, soup, scrub_pii)
+                page = self.__parse_wiki_page(url, soup, scrub_pii)
                 if page is None:
                     print("    Skipped (no content)")
                     stats["skipped"] += 1
                     continue
 
-                result = self.save_document(
-                    "wiki", self._wiki_filename(url), self._build_wiki_markdown(page)
+                result = self.__save_document(
+                    "wiki", self.__wiki_filename(url), self.__build_wiki_markdown(page)
                 )
-                self._record(stats, result)
+                self.__record(stats, result)
                 print(f"    {result['status'].capitalize()}: {result['file'].name}")
 
             except WikiAuthenticationError:
@@ -1206,12 +1198,82 @@ class RCKBKnowledgeManager:
 
             time.sleep(self.WIKI_REQUEST_DELAY)
 
-        result = self.build_generation_result(**stats)
+        result = self.__build_generation_result(**stats, source="Wiki", started=started)
 
         # A partial run (max_pages) would flag every unvisited page
         if not max_pages:
-            result["stale_files"] = self._find_stale_files("wiki", "wiki_", expected_filenames)
+            result["stale_files"] = self.__find_stale_files("wiki", "wiki_", expected_filenames)
         return result
+
+    ############################
+    #       EXPORT LOGIC       #
+    ############################
+
+    @staticmethod
+    def __format_duration(seconds):
+        # 8.4s, 3m 12s or 1h 02m 05s
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        minutes, secs = divmod(int(seconds), 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}h {minutes:02d}m {secs:02d}s"
+        return f"{minutes}m {secs:02d}s"
+
+    def __count_documents(self):
+        # Number of Markdown documents in each source's subfolder
+        return {
+            source: len(list((self.output_folder / subfolder).rglob("*.md")))
+            for source, subfolder in self.SOURCE_SUBFOLDERS.items()
+        }
+
+    def __sync_to_open_webui(self, dry_run):
+        # Imported here, not at module level: app imports the business
+        # modules, so a top-level import is circular.
+        from app import app
+        from common_service_handlers.open_webui_service_handler import OpenWebUIServiceHandler
+
+        # The whole folder is synced at once; syncing one source at a time
+        # would remove the other sources' documents.
+        return OpenWebUIServiceHandler(app).sync_folder(self.output_folder, dry_run=dry_run)
+
+    # Export to the knowledge base
+    def export_to_knowledge_base(self, dry_run=False):
+        # Uploads data/knowledgebase/ to the Open WebUI knowledge base with
+        # oikb. Only new and changed documents are uploaded, and documents no
+        # longer in the folder are removed from the knowledge base.
+        # dry_run=True reports the changes without making them.
+        counts = self.__count_documents()
+        total = sum(counts.values())
+
+        # The generated documents are git-ignored, so a fresh checkout has
+        # none. Syncing an empty folder would delete everything in the
+        # knowledge base.
+        if total == 0:
+            message = (
+                f"No documents in {self.output_folder}. Refusing to sync, because "
+                "that would delete everything in the knowledge base. Run the "
+                "scrapes first."
+            )
+            print(message)
+            return {"succeeded": False, "error": message}
+
+        # An empty source is allowed (the wiki may not be set up yet), but its
+        # documents already in the knowledge base will be removed.
+        for source, count in counts.items():
+            if count == 0:
+                print(
+                    f"WARNING: no {source} documents in {self.output_folder}. Any "
+                    f"{source} documents already in the knowledge base will be removed."
+                )
+
+        print(f"Syncing {total} documents to Open WebUI (dry_run={dry_run})...")
+        started = time.monotonic()
+        succeeded, output = self.__sync_to_open_webui(dry_run)
+        print(output)
+        print(f"Open WebUI upload took {self.__format_duration(time.monotonic() - started)}")
+
+        return {"succeeded": succeeded, "documents": counts, "output": output}
 
 
 ############################
@@ -1242,7 +1304,7 @@ def netbadge_login(
     from playwright.sync_api import sync_playwright
 
     target = target or RCKBKnowledgeManager.WIKI_LOGIN_TARGET
-    output = Path(output or RCKBKnowledgeManager.wiki_default_cookies_path())
+    output = Path(output or RCKBKnowledgeManager.WIKI_DEFAULT_COOKIES_PATH)
 
     username_selector = (
         "input[name='j_username'], "
